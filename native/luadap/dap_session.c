@@ -367,6 +367,12 @@ static lua_State *step_target_L(lua_State *L) {
     return pl ? pl : L;
 }
 
+static void clear_paused_thread(void) {
+    g_sess.paused = 0;
+    g_sess.paused_L = NULL;
+    g_sess.paused_thread_id = 0;
+}
+
 static void handle_continue(cJSON *req) {
     cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
     cJSON *tidj = args ? cJSON_GetObjectItemCaseSensitive(args, "threadId") : NULL;
@@ -381,7 +387,7 @@ static void handle_continue(cJSON *req) {
     g_sess.step = DAP_STEP_NONE;
     g_sess.step_depth = 0;
     g_sess.step_L = NULL;
-    g_sess.paused = 0;
+    clear_paused_thread();
     if (body)
         cJSON_AddBoolToObject(body, "allThreadsContinued", 1);
     send_response(req, body, 1, NULL);
@@ -392,7 +398,7 @@ static void handle_next(lua_State *L, cJSON *req) {
     g_sess.step = DAP_STEP_OVER;
     g_sess.step_depth = lua_debug_current_depth(target);
     g_sess.step_L = target;
-    g_sess.paused = 0;
+    clear_paused_thread();
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
@@ -401,7 +407,7 @@ static void handle_step_in(lua_State *L, cJSON *req) {
     g_sess.step = DAP_STEP_IN;
     g_sess.step_depth = lua_debug_current_depth(target);
     g_sess.step_L = target;
-    g_sess.paused = 0;
+    clear_paused_thread();
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
@@ -410,7 +416,7 @@ static void handle_step_out(lua_State *L, cJSON *req) {
     g_sess.step = DAP_STEP_OUT;
     g_sess.step_depth = lua_debug_current_depth(target);
     g_sess.step_L = target;
-    g_sess.paused = 0;
+    clear_paused_thread();
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
@@ -615,13 +621,13 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     int can_send;
 
     if (g_sess.dead) {
-        g_sess.paused = 0;
+        clear_paused_thread();
         g_sess.configured = 1;
         return;
     }
     g_sess.dead = 1;
     g_sess.close_pending = 0;
-    g_sess.paused = 0;
+    clear_paused_thread();
     g_sess.step = DAP_STEP_NONE;
     g_sess.step_depth = 0;
     g_sess.step_L = NULL;

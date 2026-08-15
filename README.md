@@ -36,12 +36,14 @@ local dap = require("luadap")
 dap.start(host, port, true)   -- true：阻塞到 DAP configurationDone
 -- 业务脚本 / 游戏循环
 dap.update()                  -- 每帧调用
+dap.track(co, "worker")       -- 可选；start 已包装 coroutine.create / wrap
 ```
 
 - `package.cpath` 含 `bin/?.dll` 即可 `require("luadap")`。
 - **不必**把 `script/?.lua` 放进 `package.path`（DAP 在 DLL 内，不 load Lua 调试脚本）。
 - `start(..., true)`：等到 `configurationDone` 再返回（与旧 `debugger.listen` 一致）。
 - `start(..., false)`：立即返回，握手靠后续 `update()`。
+- 协程自动登记为 DAP threads（`threadId=1` 为主线程）。`coroutine.create` / `coroutine.wrap` 在 `start` 时被包装；绕过包装时用 `dap.track(co, name?)`。
 
 C++ 宿主等价写法见 `main/main.cpp`：`require("luadap")` → `start(..., true)` → `RunFile(sample)` → 循环 `update()`。
 
@@ -126,6 +128,8 @@ python script/test/test_dap_disconnect.py
 python script/test/test_dap_partial_frame.py
 python script/test/test_dap_condition.py
 python script/test/test_dap_table_cycle.py
+python script/test/test_dap_coro_threads.py
+python script/test/test_dap_coro.py
 ```
 
 全部走 `require("luadap")` + `bin/?.dll`，**不**依赖磁盘 `lua-runtime`。
@@ -136,6 +140,6 @@ python script/test/test_dap_table_cycle.py
 
 - 已 strip debug info 的字节码看不到变量；LuaJIT `-O2` 下部分 local 可能被优化
 - V1 不做 pathMappings（同机路径规范化即可）
-- 协程调试未包含
+- 协程映射为 DAP threads：`start` 时包装 `coroutine.create` / `coroutine.wrap`；绕过包装的创建需 `dap.track(co, name?)`。未暂停协程的 `stackTrace` 为空栈。本轮不做 DAP `pause` 请求。
 - `vscode-extension/` 为历史目录，V1 非必需
 - `luadap` 不导出 `shutdown`；进程退出由宿主负责
