@@ -3,11 +3,10 @@ cmake_minimum_required(VERSION 3.16)
 set(ASYNCSOCKET_SOURCES asyncsocket.c poll_loop.c)
 
 function(asyncsocket_configure target)
-    target_sources(${target} PRIVATE
-        ${CMAKE_SOURCE_DIR}/native/common/lua_compat.c)
     target_include_directories(${target} PRIVATE
-        ${CMAKE_SOURCE_DIR}/3rd/lua-5.4.8/inc
+        ${LUA_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/native/common)
+    target_link_libraries(${target} PRIVATE lua_compat)
 
     if(TARGET liblua)
         target_link_libraries(${target} PRIVATE liblua)

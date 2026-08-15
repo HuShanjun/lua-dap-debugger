@@ -69,4 +69,18 @@ void luaL_setmetatable(lua_State *L, const char *tname) {
     lua_setmetatable(L, -2);
 }
 
+void *luaL_testudata(lua_State *L, int ud, const char *tname) {
+    void *p = lua_touserdata(L, ud);
+    if (p != NULL) {
+        if (lua_getmetatable(L, ud)) {
+            luaL_getmetatable(L, tname);
+            if (!lua_rawequal(L, -1, -2))
+                p = NULL;
+            lua_pop(L, 2);
+            return p;
+        }
+    }
+    return NULL;
+}
+
 #endif /* 501 */

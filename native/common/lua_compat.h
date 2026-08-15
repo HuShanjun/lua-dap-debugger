@@ -36,6 +36,9 @@ const char *luaL_tolstring(lua_State *L, int idx, size_t *len);
 #ifndef luaL_setmetatable
 void luaL_setmetatable(lua_State *L, const char *tname);
 #endif
+#ifndef luaL_testudata
+void *luaL_testudata(lua_State *L, int ud, const char *tname);
+#endif
 /* uservalue ↔ fenv (table only) */
 #ifndef lua_getuservalue
 #define lua_getuservalue(L, i) (lua_getfenv((L), (i)))
