@@ -223,6 +223,25 @@ static int push_frame_env(lua_State *L, int level, int frame_id,
 }
 
 /*
+ * Attach frame env to a freshly loaded chunk. 5.1 has no _ENV upvalue;
+ * setfenv is the equivalent. 5.2+ sets upvalue 1 (_ENV). setfenv and a
+ * successful setupvalue both consume the pushed env copy. Failed
+ * setupvalue leaves the copy; pop it so the chunk stays at top.
+ */
+static void ld_set_chunk_env(lua_State *L, int chunk_idx, int env_idx) {
+    chunk_idx = lua_absindex(L, chunk_idx);
+    env_idx = lua_absindex(L, env_idx);
+#if LUA_VERSION_NUM == 501
+    lua_pushvalue(L, env_idx);
+    lua_setfenv(L, chunk_idx);
+#else
+    lua_pushvalue(L, env_idx);
+    if (lua_setupvalue(L, chunk_idx, 1) == NULL)
+        lua_pop(L, 1);
+#endif
+}
+
+/*
  * Gold eval_breakpoint_condition: locals then upvalues (local wins if
  * already set), __index=_G, load "return (condition)", pcall. Compile or
  * runtime failure → no hit. Empty/missing condition → hit.
@@ -258,9 +277,7 @@ static int eval_breakpoint_condition(lua_State *L, int level,
     }
     free(src);
 
-    lua_pushvalue(L, env);
-    if (lua_setupvalue(L, -2, 1) == NULL)
-        lua_pop(L, 1);
+    ld_set_chunk_env(L, -1 /* chunk after load */, env);
 
     if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
         lua_settop(L, top);
@@ -725,9 +742,7 @@ cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
     }
     free(src);
 
-    lua_pushvalue(L, env);
-    if (lua_setupvalue(L, -2, 1) == NULL)
-        lua_pop(L, 1);
+    ld_set_chunk_env(L, -1 /* chunk after load */, env);
 
     if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
         luaerr = lua_tostring(L, -1);
