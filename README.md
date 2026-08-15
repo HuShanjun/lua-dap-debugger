@@ -1,8 +1,10 @@
 # Lua DAP Debugger
 
-C++ 宿主通过 **asyncsocket**（WSAPoll/poll 后台线程 + 主线程 `pump`）提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员。
+C++ 宿主通过 **`luadap.dll`** 提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员。
 
-DAP 传输路径**不再**使用阻塞式 luasocket 读写；宿主需在主循环中调用 **`dbg.update()`**（`asyncsocket.pump` + resume DAP 读协程），以便运行中处理 disconnect 等事件。
+对外只需 **`bin/luadap.dll`**：内部嵌入 `debugger.lua` / `dkjson.lua`，并静态链接 asyncsocket。部署**不需要**旁路 `debugger.lua`、`dkjson.lua` 或独立 `asyncsocket.dll`。
+
+宿主在主循环中调用 **`dap.update()`**（泵网络事件 + resume DAP 读协程），以便运行中处理 disconnect 等事件。
 
 V1 **不需要** `vscode-extension/`（可保留但不参与调试流程）。
 
@@ -12,16 +14,36 @@ V1 **不需要** `vscode-extension/`（可保留但不参与调试流程）。
 
 ```
 lua-dap-debugger/
-├── main/main.cpp                 # 宿主：listen → sample → 循环 dbg.update()
+├── main/main.cpp                 # 宿主：luadap.start → sample → 循环 dap.update()
+├── native/luadap/                # 单 DLL：嵌入 Lua + 静态链 asyncsocket
 ├── native/asyncsocket/           # 异步 TCP C 扩展（poll 线程 + pump）
 ├── script/lua-runtime/
-│   ├── debugger.lua              # DAP server + hook + 断点/步进/变量
+│   ├── debugger.lua              # DAP 源（可编辑；编进 luadap.dll）
 │   └── dkjson.lua
 ├── script/sample/main.lua        # 演示 locals + nested table
 ├── script/test/                  # Python DAP 冒烟测试
-├── bin/                          # 编译产物：main.exe、asyncsocket.dll、lua.exe
+├── bin/                          # 编译产物：main.exe、luadap.dll、lua.exe
 └── .vscode/launch.json           # type: node + debugServer: 8172
 ```
+
+---
+
+## 一 DLL 接入（`luadap`）
+
+```lua
+local dap = require("luadap")
+dap.start(host, port, true)   -- true：阻塞到 DAP configurationDone
+-- 业务脚本 / 游戏循环
+dap.update()                  -- 每帧调用
+```
+
+- `package.cpath` 含 `bin/?.dll` 即可 `require("luadap")`。
+- **不必**把 `script/?.lua` 放进 `package.path`（调试器已嵌入 DLL）。
+- `start(..., true)`：等到 `configurationDone` 再返回（与旧 `debugger.listen` 一致）。
+- `start(..., false)`：立即返回，握手靠后续 `update()`。
+- 改 `script/lua-runtime/*.lua` 后必须**重编** `luadap.dll`。
+
+C++ 宿主等价写法见 `main/main.cpp`：`require("luadap")` → `start(..., true)` → `RunFile(sample)` → 循环 `update()`。
 
 ---
 
@@ -32,13 +54,13 @@ lua-dap-debugger/
 用仓库已有的 CMake / MSVC 流程编译，确保以下文件可用：
 
 - `bin/main.exe`
-- `bin/asyncsocket.dll`（`require("asyncsocket")`）
-- `script/lua-runtime/debugger.lua` 等 Lua 脚本
+- `bin/luadap.dll`（`require("luadap")`）
 
 示例（本机已配置过 `build/msvc` 时）：
 
 ```powershell
 cmake --build E:\demo\lua-dap-debugger\build\msvc --target main --config Debug
+cmake --build E:\demo\lua-dap-debugger\build\msvc --target luadap --config Debug
 ```
 
 默认端口 `8172`，可用环境变量 `LUADAP_HOST` / `LUADAP_PORT` 覆盖。
@@ -55,7 +77,7 @@ cmake --build E:\demo\lua-dap-debugger\build\msvc --target main --config Debug
 [lua-dap] listening on 127.0.0.1:8172, waiting for VS Code debugServer...
 ```
 
-`listen` 内部通过 `dbg.update()` 泵事件，直到 DAP 握手完成（`configurationDone`），**然后**才执行 `script/sample/main.lua`。
+`start(..., true)` 内部泵事件，直到 DAP 握手完成（`configurationDone`），**然后**才执行 `script/sample/main.lua`。
 
 ### 3. VS Code 附加
 
@@ -90,41 +112,17 @@ Continue / Step Over / Step Into / Step Out 可用。停止调试后宿主应继
 
 ---
 
-## 宿主接入
-
-业务脚本之前调用 `listen`；主循环中每帧调用 `update`：
-
-```lua
-local host = os.getenv("LUADAP_HOST") or "127.0.0.1"
-local port = tonumber(os.getenv("LUADAP_PORT") or "8172")
-local dbg = require("lua-runtime.debugger")
-dbg.listen(host, port)  -- 内部泵到 configurationDone（非阻塞 luasocket）
-
--- 游戏 / 长驻宿主主循环示例：
-while true do
-    -- your_game_update()
-    dbg.update()  -- asyncsocket.pump + resume DAP 读协程
-end
-
-dbg.shutdown()  -- debugee 结束后发送 terminated 并释放 hook/socket
-```
-
-`package.path` 需能 `require("lua-runtime.debugger")`（`script/?.lua`）；`package.cpath` 需能 `require("asyncsocket")`（`bin/?.dll` → `bin/asyncsocket.dll`）。
-
-C++ 宿主等价写法（见 `main/main.cpp`）：绑定 `dbg.update` 后在 `while` 循环中每帧调用，并配合短 `sleep` 空转。
-
----
-
 ## 自动化冒烟（可选）
 
 ```powershell
 cd E:\demo\lua-dap-debugger\script\test
+python test_dap_luadap_handshake.py
 python test_dap_handshake.py
 python test_dap_breakpoint.py
 python test_dap_step.py
 ```
 
-这些测试走 `lua.exe` + 独立 debugee，不启动 `main.exe`。
+`test_dap_luadap_handshake.py` 走 `lua.exe` + `run_debugee_luadap.lua`，`cpath` 仅 `bin/?.dll`，**不**依赖磁盘 `lua-runtime`。其余测试仍走旧 `debugger.listen` 路径。
 
 ---
 
@@ -134,3 +132,4 @@ python test_dap_step.py
 - V1 不做 pathMappings（同机路径规范化即可）
 - 协程调试未包含
 - `vscode-extension/` 为历史目录，V1 非必需
+- `luadap` 不导出 `shutdown`；进程退出由宿主负责

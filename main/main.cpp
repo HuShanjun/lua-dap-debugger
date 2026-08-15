@@ -51,10 +51,10 @@ bool RunFile(sol::state& lua, const std::string& file)
 }
 
 auto launch_dbg = R"(
+local dap = require("luadap")
 local host = os.getenv("LUADAP_HOST") or "127.0.0.1"
 local port = tonumber(os.getenv("LUADAP_PORT") or "8172")
-local dbg = require("lua-runtime.debugger")
-dbg.listen(host, port)
+dap.start(host, port, true)
 )";
 
 int main(int argc, char* args[])
@@ -74,7 +74,7 @@ int main(int argc, char* args[])
             return 1;
         }
         sol::protected_function require_fn = lua["require"];
-        sol::table dbg_mod = require_fn("lua-runtime.debugger");
+        sol::table dbg_mod = require_fn("luadap");
         dbg_update = dbg_mod["update"];
     } catch (const std::exception& e) {
         std::cerr << "Debugger listen failed: " << e.what() << std::endl;
@@ -104,10 +104,5 @@ int main(int argc, char* args[])
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    auto shutdown = lua.safe_script("require('lua-runtime.debugger').shutdown()");
-    if (!shutdown.valid()) {
-        sol::error err = shutdown;
-        std::cerr << "Debugger shutdown: " << err.what() << std::endl;
-    }
     return 0;
 }
