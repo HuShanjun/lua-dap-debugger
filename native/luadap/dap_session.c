@@ -38,6 +38,9 @@ struct dap_session {
     int dead;
     int close_pending;
     int hook_installed;
+    int paused;
+    int step; /* 0 = none; Task 5 */
+    int next_ref;
     int seq;
     dap_recv_buf recv_buf;
     dap_bp_file *bp_files;
@@ -62,7 +65,7 @@ static char *xstrdup(const char *s) {
 
 /* Path normalize (same as debugger.lua): strip leading @, \→/, lowercase
  * drive letter, strip trailing /. Returns malloc'd string; caller frees. */
-static char *normalize_path(const char *path) {
+char *dap_session_normalize_path(const char *path) {
     char *out;
     size_t n, i, w;
 
@@ -221,11 +224,12 @@ static void send_response(cJSON *req, cJSON *body, int success, const char *mess
     cJSON_Delete(resp);
 }
 
-static void send_event(const char *event, cJSON *body) {
+static int send_event(const char *event, cJSON *body) {
     cJSON *obj = cJSON_CreateObject();
+    int rc;
     if (!obj) {
         cJSON_Delete(body);
-        return;
+        return -1;
     }
     cJSON_AddStringToObject(obj, "type", "event");
     cJSON_AddStringToObject(obj, "event", event ? event : "");
@@ -233,8 +237,9 @@ static void send_event(const char *event, cJSON *body) {
         body = cJSON_CreateObject();
     if (body)
         cJSON_AddItemToObject(obj, "body", body);
-    send_raw(obj);
+    rc = send_raw(obj);
     cJSON_Delete(obj);
+    return rc;
 }
 
 static void handle_initialize(cJSON *req) {
@@ -284,7 +289,7 @@ static void handle_set_breakpoints(cJSON *req) {
     const char *raw = (pathj && cJSON_IsString(pathj) && pathj->valuestring)
                           ? pathj->valuestring
                           : "";
-    char *path = normalize_path(raw);
+    char *path = dap_session_normalize_path(raw);
     dap_bp_file *file;
     cJSON *out;
     cJSON *body;
@@ -356,6 +361,15 @@ static void handle_configuration_done(cJSON *req) {
     /* Do not install the hook here: host thread update/wait installs it. */
 }
 
+static void handle_continue(cJSON *req) {
+    cJSON *body = cJSON_CreateObject();
+    g_sess.step = 0;
+    g_sess.paused = 0;
+    if (body)
+        cJSON_AddBoolToObject(body, "allThreadsContinued", 1);
+    send_response(req, body, 1, NULL);
+}
+
 static void dispatch(cJSON *msg) {
     cJSON *type;
     cJSON *cmdj;
@@ -385,6 +399,8 @@ static void dispatch(cJSON *msg) {
         handle_set_breakpoints(msg);
     else if (strcmp(cmd, "configurationDone") == 0)
         handle_configuration_done(msg);
+    else if (strcmp(cmd, "continue") == 0)
+        handle_continue(msg);
     else {
         char buf[160];
         snprintf(buf, sizeof(buf), "not supported: %s", cmd);
@@ -392,14 +408,59 @@ static void dispatch(cJSON *msg) {
     }
 }
 
+int dap_session_is_dead(void) { return g_sess.dead; }
+
+int dap_session_client_open(void) { return g_sess.client_open; }
+
+int dap_session_is_paused(void) { return g_sess.paused; }
+
+void dap_session_set_paused(int paused) { g_sess.paused = paused ? 1 : 0; }
+
+void dap_session_clear_step(void) { g_sess.step = 0; }
+
+void dap_session_reset_var_maps(void) {
+    /* Task 4 owns var_refs / table_to_ref; reset the allocator each stop. */
+    g_sess.next_ref = 1000;
+}
+
+int dap_session_bp_should_stop(const char *norm_path, int line) {
+    size_t i, j;
+    if (!norm_path) return 0;
+    for (i = 0; i < g_sess.bp_n; i++) {
+        if (!g_sess.bp_files[i].path ||
+            strcmp(g_sess.bp_files[i].path, norm_path) != 0)
+            continue;
+        for (j = 0; j < g_sess.bp_files[i].n; j++) {
+            if (g_sess.bp_files[i].items[j].line == line)
+                return 1; /* empty/missing condition → hit; skip cond eval */
+        }
+    }
+    return 0;
+}
+
+int dap_session_send_stopped(const char *reason) {
+    cJSON *body = cJSON_CreateObject();
+    if (!body) return -1;
+    if (!cJSON_AddStringToObject(body, "reason", reason ? reason : "breakpoint") ||
+        !cJSON_AddNumberToObject(body, "threadId", 1) ||
+        !cJSON_AddBoolToObject(body, "allThreadsStopped", 1)) {
+        cJSON_Delete(body);
+        return -1;
+    }
+    return send_event("stopped", body);
+}
+
 void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     (void)disconnect_req;
     if (g_sess.dead) {
+        g_sess.paused = 0;
         g_sess.configured = 1;
         return;
     }
     g_sess.dead = 1;
     g_sess.close_pending = 0;
+    g_sess.paused = 0;
+    g_sess.step = 0;
     g_sess.configured = 1;
     lua_debug_clear_hook(L);
     g_sess.hook_installed = 0;
@@ -483,6 +544,7 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
     dap_recv_buf_free(&g_sess.recv_buf);
     memset(&g_sess, 0, sizeof(g_sess));
     dap_recv_buf_init(&g_sess.recv_buf);
+    g_sess.next_ref = 1000;
 
     if (as_net_init() != 0) return -1;
     g_sess.sock = as_socket_listen(host, port, err, sizeof(err));
@@ -499,6 +561,11 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
                 break;
             }
             short_sleep();
+        }
+        /* Host thread after wait: same thread that will run debugee code. */
+        if (g_sess.client_open && !g_sess.dead && !g_sess.hook_installed) {
+            lua_debug_install_hook(L);
+            g_sess.hook_installed = 1;
         }
     }
     return 0;
