@@ -13,6 +13,21 @@
     "onDebug"
   ],
   "contributes": {
+    "configuration": {
+      "title": "Lua DAP",
+      "properties": {
+        "luadap.runnerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override path to lua-runner (otherwise the bundled Windows x64 binary is used)"
+        },
+        "luadap.defaultPort": {
+          "type": "number",
+          "default": 8172,
+          "description": "Default DAP TCP port for Attach"
+        }
+      }
+    },
     "debuggers": [
       {
         "type": "lua-dap",
@@ -23,20 +38,28 @@
             "properties": {
               "program": {
                 "type": "string",
-                "description": "要调试的 Lua 文件"
+                "description": "Lua file to debug"
               },
               "args": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "传递给程序的参数"
+                "description": "Arguments passed to the Lua script"
               },
               "cwd": {
                 "type": "string",
-                "description": "工作目录"
+                "description": "Working directory"
               },
-              "luaexe": {
+              "host": {
                 "type": "string",
-                "description": "Lua 解释器路径，如 \"lua\" 或 \"lua5.4\""
+                "description": "DAP listen address (default 127.0.0.1)"
+              },
+              "port": {
+                "type": "number",
+                "description": "DAP listen port (default: pick a free port)"
+              },
+              "runnerPath": {
+                "type": "string",
+                "description": "Override path to lua-runner for this session"
               }
             }
           },
@@ -44,24 +67,50 @@
             "properties": {
               "host": {
                 "type": "string",
-                "description": "调试后端地址"
+                "description": "DAP server address",
+                "default": "127.0.0.1"
               },
               "port": {
                 "type": "number",
-                "description": "调试后端端口"
+                "description": "DAP server port",
+                "default": 8172
               }
             }
           }
         },
-        "configurations": [
+        "configurationSnippets": [
+          {
+            "label": "Lua DAP: Launch",
+            "description": "Launch a Lua file via lua-runner",
+            "body": {
+              "type": "lua-dap",
+              "request": "launch",
+              "name": "Lua DAP: Launch current file",
+              "program": "${file}",
+              "args": [],
+              "cwd": "${workspaceFolder}"
+            }
+          },
+          {
+            "label": "Lua DAP: Attach",
+            "description": "Attach to a process already listening for DAP",
+            "body": {
+              "type": "lua-dap",
+              "request": "attach",
+              "name": "Lua DAP: Attach",
+              "host": "127.0.0.1",
+              "port": 8172
+            }
+          }
+        ],
+        "initialConfigurations": [
           {
             "type": "lua-dap",
             "request": "launch",
-            "name": "Lua DAP: Launch",
-            "program": "${workspaceFolder}/main.lua",
+            "name": "Lua DAP: Launch current file",
+            "program": "${file}",
             "args": [],
-            "cwd": "${workspaceFolder}",
-            "luaexe": "lua"
+            "cwd": "${workspaceFolder}"
           },
           {
             "type": "lua-dap",
