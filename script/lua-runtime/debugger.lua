@@ -15,8 +15,9 @@ local state = {
     client_open = false,
     seq = 0,
     configured = false,
-    breakpoints = {}, -- [norm_path] = { [line] = true }
+    breakpoints = {}, -- [norm_path] = { [line] = { condition = string|nil } }
     var_refs = {},
+    table_to_ref = {}, -- table identity -> variablesReference (same stop)
     next_ref = 1000,
     step = nil, -- nil | "in" | "over" | "out"
     step_depth = 0,
@@ -100,7 +101,7 @@ local function handle_initialize(req)
     send_response(req, {
         supportsConfigurationDoneRequest = true,
         supportsSetVariable = false,
-        supportsConditionalBreakpoints = false,
+        supportsConditionalBreakpoints = true,
         supportsEvaluateForHovers = false,
     })
     send_event("initialized")
@@ -126,8 +127,17 @@ local function handle_set_breakpoints(req)
     local out = {}
     for _, bp in ipairs(args.breakpoints or {}) do
         local line = bp.line
-        state.breakpoints[path][line] = true
-        out[#out + 1] = { line = line, verified = true }
+        local cond = bp.condition
+        if type(cond) == "string" then
+            cond = cond:match("^%s*(.-)%s*$")
+            if cond == "" then cond = nil end
+        else
+            cond = nil
+        end
+        state.breakpoints[path][line] = { condition = cond }
+        local verified = { line = line, verified = true }
+        if cond then verified.condition = cond end
+        out[#out + 1] = verified
     end
     send_response(req, { breakpoints = out })
 end
@@ -174,6 +184,7 @@ local function shutdown_session(req)
     end
     state.breakpoints = {}
     state.var_refs = {}
+    state.table_to_ref = {}
     state.next_ref = 1000
 end
 
@@ -331,6 +342,8 @@ end
 --   locals scope:  100000 + frameId
 --   upvalues scope:200000 + frameId
 --   table object:  state.next_ref (reset to 1000 each stop; stays < 100000)
+--   Same Lua table object reuses one ref (table_to_ref). Circular children
+--   along the expansion ancestor chain are shown as non-expandable.
 --
 -- Stack calibration (Task 3 + Task 4):
 -- Do NOT use debug.getinfo(2) or a blind frameId+3 offset. The set-hook
@@ -360,15 +373,29 @@ local function walk_user_frames()
 end
 
 local function alloc_ref(value)
+    local existing = state.table_to_ref[value]
+    if existing then
+        return existing
+    end
     local ref = state.next_ref
     state.next_ref = state.next_ref + 1
     state.var_refs[ref] = value
+    state.table_to_ref[value] = ref
     return ref
 end
 
-local function format_var(name, value)
+-- ancestors: set of tables on the path from the expanded root to the parent
+local function format_var(name, value, ancestors)
     local t = type(value)
     if t == "table" then
+        if ancestors and ancestors[value] then
+            return {
+                name = tostring(name),
+                value = "table (circular)",
+                type = "table",
+                variablesReference = 0,
+            }
+        end
         return {
             name = tostring(name),
             value = "table",
@@ -405,7 +432,7 @@ local function collect_locals(frameId)
         local name, value = local_at(level, i)
         if not name then break end
         if name:sub(1, 1) ~= "(" then
-            out[#out + 1] = format_var(name, value)
+            out[#out + 1] = format_var(name, value, nil)
         end
         i = i + 1
     end
@@ -421,16 +448,23 @@ local function collect_upvalues(frameId)
     while true do
         local name, value = debug.getupvalue(f.info.func, i)
         if not name then break end
-        out[#out + 1] = format_var(name, value)
+        out[#out + 1] = format_var(name, value, nil)
         i = i + 1
     end
     return out
 end
 
-local function collect_table(tbl)
+local function collect_table(tbl, ancestors)
+    local next_anc = {}
+    if ancestors then
+        for k, v in pairs(ancestors) do
+            next_anc[k] = v
+        end
+    end
+    next_anc[tbl] = true
     local out = {}
     for k, v in pairs(tbl) do
-        out[#out + 1] = format_var(k, v)
+        out[#out + 1] = format_var(k, v, next_anc)
     end
     table.sort(out, function(a, b) return a.name < b.name end)
     return out
@@ -471,7 +505,13 @@ handle_variables = function(req)
         vars = collect_locals(ref - 100000)
     else
         local tbl = state.var_refs[ref]
-        vars = (type(tbl) == "table") and collect_table(tbl) or {}
+        if type(tbl) == "table" then
+            -- Seed ancestors with this table so self-refs / back-edges are
+            -- marked circular even on the first expand request.
+            vars = collect_table(tbl, { [tbl] = true })
+        else
+            vars = {}
+        end
     end
     send_response(req, { variables = vars })
 end
@@ -485,6 +525,7 @@ local function pause_loop(reason, file, line)
     state.pause_thread = coroutine.running()
     state.resume_cmd = nil
     state.var_refs = {}
+    state.table_to_ref = {}
     state.next_ref = 1000
     local sent = pcall(send_event, "stopped", {
         reason = reason,
@@ -507,6 +548,46 @@ local function pause_loop(reason, file, line)
     state.pause_thread = nil
 end
 
+local function eval_breakpoint_condition(condition, level_from_caller)
+    if not condition or condition == "" then
+        return true
+    end
+    -- level_from_caller is relative to on_line; this frame sits in between.
+    local level = level_from_caller + 1
+    local env = {}
+    local i = 1
+    while true do
+        local name, value = debug.getlocal(level, i)
+        if not name then break end
+        if name:sub(1, 1) ~= "(" then
+            env[name] = value
+        end
+        i = i + 1
+    end
+    local info = debug.getinfo(level, "f")
+    if info and info.func then
+        local j = 1
+        while true do
+            local name, value = debug.getupvalue(info.func, j)
+            if not name then break end
+            if env[name] == nil then
+                env[name] = value
+            end
+            j = j + 1
+        end
+    end
+    setmetatable(env, { __index = _G })
+    local chunk = load("return (" .. condition .. ")", "@bp_condition", "t", env)
+    if not chunk then
+        return false
+    end
+    local ok, res = pcall(chunk)
+    if not ok then
+        return false
+    end
+    return not not res
+end
+
 local function on_line()
     if state.dead or not state.client_open then return end
     -- Wrapper hook + debugger internals sit above the debugee; walk to the
@@ -526,9 +607,13 @@ local function on_line()
     if line <= 0 then return end
 
     local file_bps = state.breakpoints[file]
-    if file_bps and file_bps[line] then
-        pause_loop("breakpoint", file, line)
-        return
+    local bp = file_bps and file_bps[line]
+    if bp then
+        if eval_breakpoint_condition(bp.condition, level) then
+            pause_loop("breakpoint", file, line)
+            return
+        end
+        -- Condition false: do not stop; still allow stepping below.
     end
 
     if state.step == "in" then

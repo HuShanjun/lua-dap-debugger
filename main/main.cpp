@@ -83,10 +83,18 @@ int main(int argc, char* args[])
 
     RunFile(lua, "E:/demo/lua-dap-debugger/script/sample/main.lua");
 
-    // Host main loop: long-running games call their update here each iteration.
-    // Sample debugee is synchronous; keep pumping dbg.update() so runtime
-    // disconnect/teardown is handled via asyncsocket (then exit for shutdown).
+    // Pump asyncsocket DAP every tick. If the script defines update(), call it too.
+    int update_count = 0;
+    sol::protected_function lua_main_update = lua["update"];
     for (;;) {
+        if (lua_main_update.valid()) {
+            auto biz = lua_main_update(++update_count);
+            if (!biz.valid()) {
+                sol::error err = biz;
+                std::cerr << "Script update: " << err.what() << std::endl;
+                break;
+            }
+        }
         auto result = dbg_update();
         if (!result.valid()) {
             sol::error err = result;
@@ -94,7 +102,6 @@ int main(int argc, char* args[])
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        break; // sample host only; remove for long-running debugees
     }
 
     auto shutdown = lua.safe_script("require('lua-runtime.debugger').shutdown()");
