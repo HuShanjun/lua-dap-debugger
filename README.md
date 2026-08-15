@@ -47,6 +47,43 @@ dap.track(co, "worker")       -- 可选；start 已包装 coroutine.create / wra
 
 C++ 宿主等价写法见 `main/main.cpp`：`require("luadap")` → `start(..., true)` → `RunFile(sample)` → 循环 `update()`。
 
+内部传输已切到通用 `asyncsocket` C API（`as_listen` / `as_conn_send` / `as_take_events`）。DAP 仍只接受 **一个** 调试客户端：第二个入站连接会被关掉。`disconnect` 只结束当前 client，**不停 listen**，所以 VS Code 可再 F5 附加。
+
+---
+
+## 通用异步 TCP（`asyncsocket` 0.3）
+
+独立模块 `bin/asyncsocket.dll`：`require("asyncsocket")`，Lua 对象为 **Server + Connection**。`pump()` 只在主线程 drain 事件并触发回调。V1 全进程一个 `listen`；`connect` 可多个。
+
+```lua
+local as = require("asyncsocket")
+
+-- Server
+local srv = as.listen("127.0.0.1", 9000)
+srv:on_accept(function(conn)
+  conn:on_message(function(chunk)
+    conn:send(chunk)  -- 原始字节，不组帧
+  end)
+  conn:on_close(function() end)
+end)
+-- srv:close() 只停 listen；已接受的 connection 仍保留
+
+-- Client
+local conn = as.connect("127.0.0.1", 9000)
+conn:on_open(function()
+  conn:send("ping")
+end)
+conn:on_message(function(chunk) end)
+conn:on_close(function() end)
+
+while running do
+  as.pump()
+  as.sleep(0.01)
+end
+```
+
+`as._VERSION` 为 `"0.3.0"`。旧 listen 对象上的 `on_open`/`on_message` 已移除（破坏性）。
+
 ---
 
 ## 快速开始（V1 真实流程）
@@ -119,8 +156,11 @@ Continue / Step Over / Step Into / Step Out 可用。停止调试后宿主应继
 ```powershell
 cd E:\demo\lua-dap-debugger
 python script/test/test_asyncsocket_smoke.py
+python script/test/test_asyncsocket_multi.py
+python script/test/test_asyncsocket_connect.py
 python script/test/test_dap_luadap_handshake.py
 python script/test/test_dap_luadap_nowait.py
+python script/test/test_dap_luadap_reconnect.py
 python script/test/test_dap_handshake.py
 python script/test/test_dap_breakpoint.py
 python script/test/test_dap_step.py

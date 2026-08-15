@@ -41,19 +41,6 @@ void as_engine_stop(void);  /* stop poll thread, close all fds (process teardown
 as_event *as_take_events(size_t *out_n);
 void as_events_free(as_event *evs, size_t n);
 
-/*
- * Temporary Task 1 compat for dap_session.c / asyncsocket.c (removed in Task 4).
- * Single-client semantics: ACCEPT → OPEN; extra inbound conns are closed.
- */
-typedef struct as_socket as_socket;
-
-as_socket *as_socket_listen(const char *host, int port, char *err, size_t errlen);
-void as_socket_stop(as_socket *s);
-void as_socket_destroy(as_socket *s);
-void as_socket_wakeup(as_socket *s);
-int as_socket_send(as_socket *s, const void *data, size_t len);
-as_event *as_socket_take_events(as_socket *s, size_t *out_n);
-
 #ifdef __cplusplus
 }
 #endif

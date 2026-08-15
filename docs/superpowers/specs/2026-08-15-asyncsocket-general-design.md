@@ -1,7 +1,7 @@
 # asyncsocket 通用网络库设计（Server/Client + 多连接）
 
 **日期：** 2026-08-15  
-**状态：** 待实现  
+**状态：** 已实现  
 **范围：** 将现有 DAP 专用 `asyncsocket` 演进为通用 Lua 异步 TCP 库：Server 多连接 + Client `connect`；Lua 为 Server/Connection 两层对象；底层 `poll_loop` 重写为通用核；`luadap` 一并切到新 C API。
 
 **前置：**

@@ -33,7 +33,8 @@ typedef struct {
 } dap_bp_file;
 
 struct dap_session {
-    as_socket *sock;
+    int dap_conn_id; /* 0 = no debugger client */
+    int listening;   /* 1 while as_listen is active */
     int client_open;
     int configured;
     int dead;
@@ -163,7 +164,7 @@ static dap_bp_file *bp_find_or_add(const char *path) {
  * - Do NOT free the request `req` passed to send_response.
  * - send_response / send_event free the response/event roots they build,
  *   including `body` (ownership of body transfers in).
- * - Printed JSON from cJSON_PrintUnformatted is freed after as_socket_send.
+ * - Printed JSON from cJSON_PrintUnformatted is freed after as_conn_send.
  */
 static int send_raw(cJSON *obj) {
     char *body;
@@ -174,7 +175,7 @@ static int send_raw(cJSON *obj) {
     size_t frame_len;
     int rc;
 
-    if (!obj || !g_sess.sock) return -1;
+    if (!obj || g_sess.dap_conn_id <= 0) return -1;
     g_sess.seq += 1;
     cJSON_DeleteItemFromObjectCaseSensitive(obj, "seq");
     if (!cJSON_AddNumberToObject(obj, "seq", (double)g_sess.seq))
@@ -196,7 +197,7 @@ static int send_raw(cJSON *obj) {
     memcpy(frame, hdr, (size_t)hdr_len);
     memcpy(frame + (size_t)hdr_len, body, body_len);
     cJSON_free(body);
-    rc = as_socket_send(g_sess.sock, frame, frame_len);
+    rc = as_conn_send(g_sess.dap_conn_id, frame, frame_len);
     free(frame);
     return rc;
 }
@@ -628,15 +629,20 @@ static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req) {
     int can_send;
     int was_configured;
 
-    if (g_sess.dead || !g_sess.sock)
+    if (g_sess.dead || !g_sess.listening)
         return;
 
     was_configured = g_sess.configured;
-    can_send = g_sess.client_open;
+    can_send = g_sess.client_open && g_sess.dap_conn_id > 0;
     if (can_send) {
         if (disconnect_req)
             send_response(disconnect_req, cJSON_CreateObject(), 1, NULL);
         send_event("terminated", cJSON_CreateObject());
+    }
+
+    if (g_sess.dap_conn_id > 0) {
+        as_conn_close(g_sess.dap_conn_id);
+        g_sess.dap_conn_id = 0;
     }
 
     g_sess.close_pending = 0;
@@ -662,8 +668,10 @@ static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req) {
 }
 
 void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
-    as_socket *sock;
+    int conn_id;
     int can_send;
+    as_event *leftover;
+    size_t n = 0;
 
     if (g_sess.dead) {
         clear_paused_thread();
@@ -679,9 +687,9 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     g_sess.configured = 1;
 
     /* Gold: reply + terminated while the client is still marked open, then
-     * drop the hook and socket. CLOSE+MESSAGE batches drain before this. */
-    sock = g_sess.sock;
-    can_send = (sock != NULL && g_sess.client_open);
+     * drop the hook and engine. CLOSE+MESSAGE batches drain before this. */
+    conn_id = g_sess.dap_conn_id;
+    can_send = (conn_id > 0 && g_sess.client_open);
     if (can_send) {
         if (disconnect_req)
             send_response(disconnect_req, cJSON_CreateObject(), 1, NULL);
@@ -694,11 +702,14 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     coro_registry_uninstall_wrappers(L);
     coro_registry_clear(L);
     g_sess.client_open = 0;
-    g_sess.sock = NULL;
-    if (sock) {
-        as_socket_stop(sock);
-        as_socket_destroy(sock);
-    }
+    g_sess.dap_conn_id = 0;
+    g_sess.listening = 0;
+    if (conn_id > 0)
+        as_conn_close(conn_id);
+    as_server_close();
+    as_engine_stop();
+    leftover = as_take_events(&n);
+    as_events_free(leftover, n);
     dap_recv_buf_free(&g_sess.recv_buf);
     bp_clear_all();
 }
@@ -709,21 +720,29 @@ int dap_session_update(lua_State *L) {
     size_t i;
     int k;
 
-    if (!g_sess.sock || g_sess.dead) return 0;
+    if (!g_sess.listening || g_sess.dead) return 0;
 
-    evs = as_socket_take_events(g_sess.sock, &n);
+    evs = as_take_events(&n);
     for (i = 0; i < n; i++) {
-        if (evs[i].type == AS_EVT_OPEN) {
-            g_sess.client_open = 1;
+        if (evs[i].type == AS_EVT_ACCEPT) {
+            if (g_sess.dap_conn_id == 0) {
+                g_sess.dap_conn_id = evs[i].conn_id;
+                g_sess.client_open = 1;
+            } else {
+                as_conn_close(evs[i].conn_id); /* single debugger client */
+            }
         } else if (evs[i].type == AS_EVT_MESSAGE) {
-            if (dap_recv_buf_append(&g_sess.recv_buf, evs[i].payload, evs[i].len) !=
-                0) {
-                as_events_free(evs, n);
-                dap_session_reset_client(L, NULL);
-                return 0;
+            if (g_sess.dap_conn_id > 0 && evs[i].conn_id == g_sess.dap_conn_id) {
+                if (dap_recv_buf_append(&g_sess.recv_buf, evs[i].payload,
+                                        evs[i].len) != 0) {
+                    as_events_free(evs, n);
+                    dap_session_reset_client(L, NULL);
+                    return 0;
+                }
             }
         } else if (evs[i].type == AS_EVT_CLOSE) {
-            g_sess.close_pending = 1;
+            if (g_sess.dap_conn_id > 0 && evs[i].conn_id == g_sess.dap_conn_id)
+                g_sess.close_pending = 1;
         }
     }
     as_events_free(evs, n);
@@ -770,20 +789,21 @@ int dap_session_update(lua_State *L) {
 int dap_session_start(lua_State *L, const char *host, int port, int wait) {
     char err[256];
 
-    if (g_sess.sock || g_sess.recv_buf.data || g_sess.bp_files)
+    if (g_sess.listening || g_sess.recv_buf.data || g_sess.bp_files)
         dap_session_shutdown(L, NULL);
     bp_clear_all();
     dap_recv_buf_free(&g_sess.recv_buf);
     memset(&g_sess, 0, sizeof(g_sess));
     dap_recv_buf_init(&g_sess.recv_buf);
     g_sess.next_ref = 1000;
+    g_sess.dap_conn_id = 0;
 
     if (as_net_init() != 0) return -1;
-    g_sess.sock = as_socket_listen(host, port, err, sizeof(err));
-    if (!g_sess.sock) {
+    if (as_listen(host, port, err, sizeof(err)) != 0) {
         fprintf(stderr, "[luadap] listen failed: %s\n", err);
         return -1;
     }
+    g_sess.listening = 1;
     fprintf(stderr, "[luadap] listening on %s:%d\n", host, port);
 
     coro_registry_clear(L);
