@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.20)
+project(lua-5.1.5 C)
+
+set(CMAKE_C_STANDARD 90)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+set(LUA_CORE_SRC
+  src/lapi.c src/lcode.c src/ldebug.c src/ldo.c src/ldump.c
+  src/lfunc.c src/lgc.c src/llex.c src/lmem.c src/lobject.c
+  src/lopcodes.c src/lparser.c src/lstate.c src/lstring.c src/ltable.c
+  src/ltm.c src/lundump.c src/lvm.c src/lzio.c
+)
+
+set(LUA_LIB_SRC
+  src/lauxlib.c src/lbaselib.c src/ldblib.c src/liolib.c
+  src/lmathlib.c src/loslib.c src/ltablib.c src/lstrlib.c
+  src/loadlib.c src/linit.c
+)
+
+add_library(liblua STATIC ${LUA_CORE_SRC} ${LUA_LIB_SRC})
+target_include_directories(liblua PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_property(TARGET liblua PROPERTY FOLDER "lua")
+
+add_executable(lua src/lua.c)
+target_link_libraries(lua PRIVATE liblua)
+set_property(TARGET lua PROPERTY FOLDER "lua")
+
+add_executable(luac src/luac.c src/print.c)
+target_link_libraries(luac PRIVATE liblua)
+set_property(TARGET luac PROPERTY FOLDER "lua")
+
+if(NOT WIN32)
+  target_compile_options(liblua PRIVATE -fPIC)
+endif()
+
+if(WIN32)
+  # no LUA_USE_* for default Windows static build
+elseif(APPLE)
+  target_compile_definitions(liblua PUBLIC LUA_USE_LINUX)
+  target_link_libraries(liblua PUBLIC m)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(liblua PUBLIC LUA_USE_LINUX)
+  target_link_libraries(liblua PUBLIC m dl)
+else()
+  target_compile_definitions(liblua PUBLIC LUA_USE_POSIX)
+  target_link_libraries(liblua PUBLIC m)
+endif()
