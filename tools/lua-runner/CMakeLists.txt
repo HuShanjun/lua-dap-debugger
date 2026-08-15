@@ -14,4 +14,12 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN
         _WIN32_WINNT=0x0600
         _CRT_SECURE_NO_WARNINGS)
+    add_custom_command(TARGET lua-runner POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${CMAKE_SOURCE_DIR}/vscode-extension/bin/win32-x64"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:lua-runner>"
+            "${CMAKE_SOURCE_DIR}/vscode-extension/bin/win32-x64/lua-runner.exe"
+        COMMENT "Copy lua-runner to vscode-extension/bin/win32-x64")
 endif()
+
