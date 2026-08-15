@@ -1,7 +1,7 @@
 # Lua DAP 调试器 V1 设计
 
 **日期：** 2026-08-15  
-**状态：** 待确认（已按 debugServer 方案修订）  
+**状态：** 已批准并完成 V1 实现  
 **范围：** 第一版可用 — 宿主作为 DAP TCP 服务端，VS Code 通过 `debugServer` 直连
 
 ## 目标
@@ -244,17 +244,25 @@ dbg.listen(host, port)  -- 阻塞到 configurationDone
 
 ## 验收标准
 
-手工验收：
+- [x] 1. 启动 `main.exe` → 控制台显示监听 `127.0.0.1:8172` 并等待。（Task 6 已验；`test_dap_handshake.py` 间接覆盖 listen/accept）
+- [x] 2. VS Code F5（`debugServer: 8172`）→ 握手成功，sample 开始执行。（`test_dap_handshake.py` 覆盖 DAP 握手 + 脚本继续；VS Code F5 需手工）
+- [x] 3. 在 `sample/main.lua` 某行打断点 → 命中且行号正确。（`test_dap_breakpoint.py`）
+- [x] 4. Variables 能看到 locals；展开 table 能看到字段。（`test_dap_breakpoint.py`：x/y/player + player.name/stats）
+- [x] 5. Continue / Step Over / Step Into / Step Out 可用。（`test_dap_step.py`：next / stepIn / stepOut / continue）
+- [ ] 6. 停止调试后宿主不卡死（继续跑完或可预期退出）。（未在本环境跑 VS Code Stop；`disconnect` 路径在代码中实现，建议手工确认）
 
-1. 启动 `main.exe` → 控制台显示监听 `127.0.0.1:8172` 并等待。
-2. VS Code F5（`debugServer: 8172`）→ 握手成功，sample 开始执行。
-3. 在 `sample/main.lua` 某行打断点 → 命中且行号正确。
-4. Variables 能看到 locals；展开 table 能看到字段。
-5. Continue / Step Over / Step Into / Step Out 可用。
-6. 停止调试后宿主不卡死（继续跑完或可预期退出）。
-
-可选后续：用 Python/Node 写一个说 DAP 的 TCP 客户端做冒烟测试。
+自动化冒烟：`script/test/test_dap_handshake.py`、`test_dap_breakpoint.py`、`test_dap_step.py`（2026-08-15 全部通过）。
 
 ## 非目标（再次强调）
 
 V1 故意收窄：仅 `debugServer` 直连、同机路径、断点 + 步进 + locals/table 成员。自定义扩展、launch、远程 path mapping、表达式求值等一律后置。
+
+## 实现备注
+
+| 项 | 实际实现 |
+|----|----------|
+| 栈帧校准 | 不用固定 `frameId+3` 或 `debug.getinfo(2)`。`walk_user_frames()` 从 level 2 起跳过 `debugger.lua` / `dkjson.lua` 及非 `@` 源；`getlocal` 用 `level - 1`（相对调用方），`frame_id 0` 为离暂停点最近的用户帧。 |
+| 变量 reference | locals scope = `100000 + frameId`；upvalues = `200000 + frameId`；table 对象 ref 自 `1000` 递增，每次 stop 重置，与 scope id 不冲突。 |
+| luasocket | `require("socket")`；宿主 `package.cpath` 指向 `bin/?.dll`（Windows 上勿用 `path/?.dll` 会变成盘根路径）。 |
+| 测试 debugee | 冒烟用 `lua.exe` + `run_debugee*.lua`，非 `main.exe`；行为与 `debugger.listen` 一致。 |
+| VS Code | `type: node` + `debugServer` 仅借 Node 调试器贡献点；Node 专有选项不生效。 |
