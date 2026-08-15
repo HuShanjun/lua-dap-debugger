@@ -263,6 +263,7 @@ V1 故意收窄：仅 `debugServer` 直连、同机路径、断点 + 步进 + lo
 |----|----------|
 | 栈帧校准 | 不用固定 `frameId+3` 或 `debug.getinfo(2)`。`walk_user_frames()` 从 level 2 起跳过 `debugger.lua` / `dkjson.lua` 及非 `@` 源；`getlocal` 用 `level - 1`（相对调用方），`frame_id 0` 为离暂停点最近的用户帧。 |
 | 变量 reference | locals scope = `100000 + frameId`；upvalues = `200000 + frameId`；table 对象 ref 自 `1000` 递增，每次 stop 重置，与 scope id 不冲突。 |
-| luasocket | `require("socket")`；宿主 `package.cpath` 指向 `bin/?.dll`（Windows 上勿用 `path/?.dll` 会变成盘根路径）。 |
+| luasocket | V1 初版用 `require("socket")`；**传输层已迁移至 asyncsocket**（见下行）。 |
+| asyncsocket 传输 | DAP TCP 由 `require("asyncsocket")` + `dbg.update()` 泵事件；`listen`/`pause_loop` 内部循环 `update`，宿主主循环亦需调用。DAP 路径上不再阻塞 luasocket 读写。 |
 | 测试 debugee | 冒烟用 `lua.exe` + `run_debugee*.lua`，非 `main.exe`；行为与 `debugger.listen` 一致。 |
 | VS Code | `type: node` + `debugServer` 仅借 Node 调试器贡献点；Node 专有选项不生效。 |

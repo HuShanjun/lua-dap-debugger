@@ -1,7 +1,7 @@
 # 异步网络 I/O（WSAPoll/poll）+ DAP 读协程 设计
 
 **日期：** 2026-08-15  
-**状态：** 已批准，待实现  
+**状态：** 已实现  
 **范围：** 用独立 Lua C 扩展做异步 TCP；DAP 组帧在 Lua 协程中 yield/resume；替换 `debugger.lua` 阻塞 luasocket 读写
 
 **前置：** V1 DAP 调试器已可用（`docs/superpowers/specs/2026-08-15-lua-dap-debugger-design.md`）

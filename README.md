@@ -1,6 +1,8 @@
 # Lua DAP Debugger
 
-C++ 宿主通过 **luasocket** 提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员。
+C++ 宿主通过 **asyncsocket**（WSAPoll/poll 后台线程 + 主线程 `pump`）提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员。
+
+DAP 传输路径**不再**使用阻塞式 luasocket 读写；宿主需在主循环中调用 **`dbg.update()`**（`asyncsocket.pump` + resume DAP 读协程），以便运行中处理 disconnect 等事件。
 
 V1 **不需要** `vscode-extension/`（可保留但不参与调试流程）。
 
@@ -10,15 +12,14 @@ V1 **不需要** `vscode-extension/`（可保留但不参与调试流程）。
 
 ```
 lua-dap-debugger/
-├── main/main.cpp                 # 宿主：listen 后再跑 sample
+├── main/main.cpp                 # 宿主：listen → sample → 循环 dbg.update()
+├── native/asyncsocket/           # 异步 TCP C 扩展（poll 线程 + pump）
 ├── script/lua-runtime/
 │   ├── debugger.lua              # DAP server + hook + 断点/步进/变量
 │   └── dkjson.lua
-├── script/socket.lua             # luasocket Lua 层
 ├── script/sample/main.lua        # 演示 locals + nested table
 ├── script/test/                  # Python DAP 冒烟测试
-├── bin/                          # 编译产物：main.exe、lua.exe、socket.dll
-│   └── socket/core.dll           # require("socket.core")
+├── bin/                          # 编译产物：main.exe、asyncsocket.dll、lua.exe
 └── .vscode/launch.json           # type: node + debugServer: 8172
 ```
 
@@ -31,8 +32,8 @@ lua-dap-debugger/
 用仓库已有的 CMake / MSVC 流程编译，确保以下文件可用：
 
 - `bin/main.exe`
-- `bin/socket.dll` 以及 `bin/socket/core.dll`（`require("socket.core")`）
-- `script/socket.lua`（`require("socket")`）
+- `bin/asyncsocket.dll`（`require("asyncsocket")`）
+- `script/lua-runtime/debugger.lua` 等 Lua 脚本
 
 示例（本机已配置过 `build/msvc` 时）：
 
@@ -54,7 +55,7 @@ cmake --build E:\demo\lua-dap-debugger\build\msvc --target main --config Debug
 [lua-dap] listening on 127.0.0.1:8172, waiting for VS Code debugServer...
 ```
 
-此时进程阻塞等待调试器连接，**还不会**执行 `script/sample/main.lua`。
+`listen` 内部通过 `dbg.update()` 泵事件，直到 DAP 握手完成（`configurationDone`），**然后**才执行 `script/sample/main.lua`。
 
 ### 3. VS Code 附加
 
@@ -91,16 +92,26 @@ Continue / Step Over / Step Into / Step Out 可用。停止调试后宿主应继
 
 ## 宿主接入
 
-业务脚本之前调用：
+业务脚本之前调用 `listen`；主循环中每帧调用 `update`：
 
 ```lua
 local host = os.getenv("LUADAP_HOST") or "127.0.0.1"
 local port = tonumber(os.getenv("LUADAP_PORT") or "8172")
 local dbg = require("lua-runtime.debugger")
-dbg.listen(host, port)  -- 阻塞到 configurationDone
+dbg.listen(host, port)  -- 内部泵到 configurationDone（非阻塞 luasocket）
+
+-- 游戏 / 长驻宿主主循环示例：
+while true do
+    -- your_game_update()
+    dbg.update()  -- asyncsocket.pump + resume DAP 读协程
+end
+
+dbg.shutdown()  -- debugee 结束后发送 terminated 并释放 hook/socket
 ```
 
-`package.path` 需能 `require("lua-runtime.debugger")` 与 `require("socket")`（`script/?.lua`）；`package.cpath` 需能 `require("socket.core")`（`bin/?.dll` → `bin/socket/core.dll`）。
+`package.path` 需能 `require("lua-runtime.debugger")`（`script/?.lua`）；`package.cpath` 需能 `require("asyncsocket")`（`bin/?.dll` → `bin/asyncsocket.dll`）。
+
+C++ 宿主等价写法（见 `main/main.cpp`）：绑定 `dbg.update` 后在 `while` 循环中每帧调用，并配合短 `sleep` 空转。
 
 ---
 
