@@ -55,6 +55,8 @@ struct dap_session {
 
 static dap_session g_sess;
 
+static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req);
+
 dap_session *dap_session_get(void) { return &g_sess; }
 
 static char *xstrdup(const char *s) {
@@ -486,7 +488,8 @@ static void handle_variables(lua_State *L, cJSON *req) {
 }
 
 static void handle_disconnect(lua_State *L, cJSON *req) {
-    dap_session_shutdown(L, req);
+    /* Keep listen alive so the host can accept another VS Code F5 attach. */
+    dap_session_reset_client(L, req);
 }
 
 static void dispatch(lua_State *L, cJSON *msg) {
@@ -616,6 +619,48 @@ int dap_session_send_stopped(const char *reason) {
     return send_event("stopped", body);
 }
 
+/* End the current DAP *client* session but keep the TCP listen socket so a
+ * long-running host (start(..., false) + update loop) can accept F5 again.
+ * - If handshake never completed: set configured=1 so start(wait=true) returns.
+ * - If already configured: set configured=0 and drop hooks for a clean re-attach.
+ */
+static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req) {
+    int can_send;
+    int was_configured;
+
+    if (g_sess.dead || !g_sess.sock)
+        return;
+
+    was_configured = g_sess.configured;
+    can_send = g_sess.client_open;
+    if (can_send) {
+        if (disconnect_req)
+            send_response(disconnect_req, cJSON_CreateObject(), 1, NULL);
+        send_event("terminated", cJSON_CreateObject());
+    }
+
+    g_sess.close_pending = 0;
+    clear_paused_thread();
+    g_sess.step = DAP_STEP_NONE;
+    g_sess.step_depth = 0;
+    g_sess.step_L = NULL;
+    g_sess.client_open = 0;
+    g_sess.seq = 0;
+
+    lua_debug_clear_hook(L);
+    lua_debug_reset_var_maps(L);
+    g_sess.hook_installed = 0;
+    dap_recv_buf_free(&g_sess.recv_buf);
+    dap_recv_buf_init(&g_sess.recv_buf);
+    bp_clear_all();
+
+    /* Do not touch coro wrappers / registry — process lifetime. */
+    if (was_configured)
+        g_sess.configured = 0;
+    else
+        g_sess.configured = 1; /* unblock start(wait=true) mid-handshake */
+}
+
 void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     as_socket *sock;
     int can_send;
@@ -674,8 +719,8 @@ int dap_session_update(lua_State *L) {
             if (dap_recv_buf_append(&g_sess.recv_buf, evs[i].payload, evs[i].len) !=
                 0) {
                 as_events_free(evs, n);
-                dap_session_shutdown(L, NULL);
-                return -1;
+                dap_session_reset_client(L, NULL);
+                return 0;
             }
         } else if (evs[i].type == AS_EVT_CLOSE) {
             g_sess.close_pending = 1;
@@ -693,24 +738,24 @@ int dap_session_update(lua_State *L) {
         if (pr == 0) break;
         if (pr < 0) {
             free(json);
-            dap_session_shutdown(L, NULL);
-            return -1;
+            dap_session_reset_client(L, NULL);
+            return 0;
         }
         msg = dap_json_parse(json, jlen);
         free(json);
         if (!msg) {
-            dap_session_shutdown(L, NULL);
-            return -1;
+            dap_session_reset_client(L, NULL);
+            return 0;
         }
         dispatch(L, msg);
         cJSON_Delete(msg);
-        if (g_sess.dead) break;
+        if (g_sess.dead || !g_sess.client_open) break;
     }
 
     if (g_sess.close_pending) {
         g_sess.close_pending = 0;
         if (!g_sess.dead)
-            dap_session_shutdown(L, NULL);
+            dap_session_reset_client(L, NULL);
     } else if (g_sess.configured && !g_sess.hook_installed && g_sess.client_open &&
                !g_sess.dead) {
         lua_debug_install_hook(L);
