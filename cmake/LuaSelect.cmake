@@ -109,13 +109,13 @@ else()
     endif()
     include(FetchContent)
     set(_lua_url "https://www.lua.org/ftp/lua-${_lua_patch}.tar.gz")
+    string(REPLACE "." "_" _lua_fc_ver "${LUA_VERSION}")
+    set(_lua_fc_name "lua_src_${_lua_fc_ver}")
     message(STATUS "Fetching Lua ${_lua_patch} from ${_lua_url} (build dir, not git)")
-    FetchContent_Declare(lua_src
-        URL "${_lua_url}"
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_Declare(${_lua_fc_name} URL "${_lua_url}")
     # Official tarballs have no CMakeLists; MakeAvailable only populates.
-    FetchContent_MakeAvailable(lua_src)
-    lua_build_from_source("${lua_src_SOURCE_DIR}")
+    FetchContent_MakeAvailable(${_lua_fc_name})
+    lua_build_from_source("${${_lua_fc_name}_SOURCE_DIR}")
 endif()
 
 if(NOT LUA_INCLUDE_DIR)
