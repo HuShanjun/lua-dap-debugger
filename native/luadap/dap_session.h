@@ -24,7 +24,7 @@ int dap_session_client_open(void);
 int dap_session_is_paused(void);
 void dap_session_set_paused(int paused);
 void dap_session_clear_step(void);
-void dap_session_reset_var_maps(void);
+void dap_session_reset_var_maps(lua_State *L);
 int dap_session_send_stopped(const char *reason);
 
 #endif

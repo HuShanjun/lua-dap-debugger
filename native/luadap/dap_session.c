@@ -370,7 +370,49 @@ static void handle_continue(cJSON *req) {
     send_response(req, body, 1, NULL);
 }
 
-static void dispatch(cJSON *msg) {
+static void handle_stack_trace(lua_State *L, cJSON *req) {
+    send_response(req, lua_debug_stack_frames(L), 1, NULL);
+}
+
+static void handle_scopes(cJSON *req) {
+    cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
+    cJSON *fid = args ? cJSON_GetObjectItemCaseSensitive(args, "frameId") : NULL;
+    int frame_id = (fid && cJSON_IsNumber(fid)) ? (int)fid->valuedouble : 0;
+    cJSON *body = cJSON_CreateObject();
+    cJSON *scopes = body ? cJSON_AddArrayToObject(body, "scopes") : NULL;
+    cJSON *loc = cJSON_CreateObject();
+    cJSON *up = cJSON_CreateObject();
+
+    if (loc) {
+        cJSON_AddStringToObject(loc, "name", "Locals");
+        cJSON_AddNumberToObject(loc, "variablesReference", 100000 + frame_id);
+        cJSON_AddBoolToObject(loc, "expensive", 0);
+        if (scopes)
+            cJSON_AddItemToArray(scopes, loc);
+        else
+            cJSON_Delete(loc);
+    }
+    if (up) {
+        cJSON_AddStringToObject(up, "name", "Upvalues");
+        cJSON_AddNumberToObject(up, "variablesReference", 200000 + frame_id);
+        cJSON_AddBoolToObject(up, "expensive", 0);
+        if (scopes)
+            cJSON_AddItemToArray(scopes, up);
+        else
+            cJSON_Delete(up);
+    }
+    send_response(req, body, 1, NULL);
+}
+
+static void handle_variables(lua_State *L, cJSON *req) {
+    cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
+    cJSON *refj = args ? cJSON_GetObjectItemCaseSensitive(args, "variablesReference")
+                       : NULL;
+    int ref = (refj && cJSON_IsNumber(refj)) ? (int)refj->valuedouble : 0;
+    send_response(req, lua_debug_collect_variables(L, ref), 1, NULL);
+}
+
+static void dispatch(lua_State *L, cJSON *msg) {
     cJSON *type;
     cJSON *cmdj;
     const char *cmd;
@@ -401,6 +443,12 @@ static void dispatch(cJSON *msg) {
         handle_configuration_done(msg);
     else if (strcmp(cmd, "continue") == 0)
         handle_continue(msg);
+    else if (strcmp(cmd, "stackTrace") == 0)
+        handle_stack_trace(L, msg);
+    else if (strcmp(cmd, "scopes") == 0)
+        handle_scopes(msg);
+    else if (strcmp(cmd, "variables") == 0)
+        handle_variables(L, msg);
     else {
         char buf[160];
         snprintf(buf, sizeof(buf), "not supported: %s", cmd);
@@ -418,9 +466,9 @@ void dap_session_set_paused(int paused) { g_sess.paused = paused ? 1 : 0; }
 
 void dap_session_clear_step(void) { g_sess.step = 0; }
 
-void dap_session_reset_var_maps(void) {
-    /* Task 4 owns var_refs / table_to_ref; reset the allocator each stop. */
+void dap_session_reset_var_maps(lua_State *L) {
     g_sess.next_ref = 1000;
+    lua_debug_reset_var_maps(L);
 }
 
 int dap_session_bp_should_stop(const char *norm_path, int line) {
@@ -463,6 +511,7 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     g_sess.step = 0;
     g_sess.configured = 1;
     lua_debug_clear_hook(L);
+    lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
     g_sess.client_open = 0;
     if (g_sess.sock) {
@@ -518,7 +567,7 @@ int dap_session_update(lua_State *L) {
             dap_session_shutdown(L, NULL);
             return -1;
         }
-        dispatch(msg);
+        dispatch(L, msg);
         cJSON_Delete(msg);
         if (g_sess.dead) break;
     }
