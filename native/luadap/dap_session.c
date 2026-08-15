@@ -435,6 +435,10 @@ static void handle_variables(lua_State *L, cJSON *req) {
     send_response(req, lua_debug_collect_variables(L, ref), 1, NULL);
 }
 
+static void handle_disconnect(lua_State *L, cJSON *req) {
+    dap_session_shutdown(L, req);
+}
+
 static void dispatch(lua_State *L, cJSON *msg) {
     cJSON *type;
     cJSON *cmdj;
@@ -478,6 +482,8 @@ static void dispatch(lua_State *L, cJSON *msg) {
         handle_scopes(msg);
     else if (strcmp(cmd, "variables") == 0)
         handle_variables(L, msg);
+    else if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0)
+        handle_disconnect(L, msg);
     else {
         char buf[160];
         snprintf(buf, sizeof(buf), "not supported: %s", cmd);
@@ -544,7 +550,9 @@ int dap_session_send_stopped(const char *reason) {
 }
 
 void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
-    (void)disconnect_req;
+    as_socket *sock;
+    int can_send;
+
     if (g_sess.dead) {
         g_sess.paused = 0;
         g_sess.configured = 1;
@@ -556,14 +564,25 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     g_sess.step = DAP_STEP_NONE;
     g_sess.step_depth = 0;
     g_sess.configured = 1;
+
+    /* Gold: reply + terminated while the client is still marked open, then
+     * drop the hook and socket. CLOSE+MESSAGE batches drain before this. */
+    sock = g_sess.sock;
+    can_send = (sock != NULL && g_sess.client_open);
+    if (can_send) {
+        if (disconnect_req)
+            send_response(disconnect_req, cJSON_CreateObject(), 1, NULL);
+        send_event("terminated", cJSON_CreateObject());
+    }
+
     lua_debug_clear_hook(L);
     lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
     g_sess.client_open = 0;
-    if (g_sess.sock) {
-        as_socket_stop(g_sess.sock);
-        as_socket_destroy(g_sess.sock);
-        g_sess.sock = NULL;
+    g_sess.sock = NULL;
+    if (sock) {
+        as_socket_stop(sock);
+        as_socket_destroy(sock);
     }
     dap_recv_buf_free(&g_sess.recv_buf);
     bp_clear_all();

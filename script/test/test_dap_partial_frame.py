@@ -76,10 +76,10 @@ def send_initialize_in_two_parts(sock):
 def main():
     lua = find_lua()
     script = f"""
-package.path = [[{ROOT.as_posix()}/script/?.lua;]] .. package.path
-package.cpath = [[{ROOT.as_posix()}/bin/?.dll;{ROOT.as_posix()}/bin/Debug/?.dll;]] .. package.cpath
-local dbg = require("lua-runtime.debugger")
-dbg.listen("127.0.0.1", {PORT})
+package.path = ""
+package.cpath = [[{ROOT.as_posix()}/bin/?.dll;{ROOT.as_posix()}/bin/Debug/?.dll;]]
+local dap = require("luadap")
+dap.start("127.0.0.1", {PORT}, true)
 print("LISTEN_DONE")
 """
     proc = subprocess.Popen(

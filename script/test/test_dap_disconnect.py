@@ -112,13 +112,12 @@ def test_pause_client_drop(lua):
 def test_handshake_disconnect(lua):
     port = 18177
     script = f"""
-package.path = [[{ROOT.as_posix()}/script/?.lua;]] .. package.path
-package.cpath = [[{ROOT.as_posix()}/bin/?.dll;{ROOT.as_posix()}/bin/Debug/?.dll;]] .. package.cpath
-local dbg = require("lua-runtime.debugger")
-dbg.listen("127.0.0.1", {port})
+package.path = ""
+package.cpath = [[{ROOT.as_posix()}/bin/?.dll;{ROOT.as_posix()}/bin/Debug/?.dll;]]
+local dap = require("luadap")
+dap.start("127.0.0.1", {port}, true)
 print("LISTEN_DONE")
 print("DEBUGEE_DONE")
-dbg.shutdown()
 """
     proc = subprocess.Popen(
         [lua, "-e", script],
