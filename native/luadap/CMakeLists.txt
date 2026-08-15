@@ -9,10 +9,13 @@ add_library(luadap SHARED
     lua_debug.c
     ${CMAKE_SOURCE_DIR}/3rd/cJSON/cJSON.c)
 
+target_sources(luadap PRIVATE
+    ${CMAKE_SOURCE_DIR}/native/common/lua_compat.c)
 target_include_directories(luadap PRIVATE
     ${CMAKE_SOURCE_DIR}/3rd/lua-5.4.8/inc
     ${CMAKE_SOURCE_DIR}/3rd/cJSON
     ${CMAKE_SOURCE_DIR}/native/asyncsocket
+    ${CMAKE_SOURCE_DIR}/native/common
     ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(luadap PRIVATE asyncsocket_static liblua)

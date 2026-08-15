@@ -5,6 +5,10 @@
 #include "lua_debug.h"
 #include "poll_loop.h"
 
+#include <lua.h>
+#include <lauxlib.h>
+#include "lua_compat.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>

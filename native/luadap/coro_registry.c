@@ -2,7 +2,9 @@
 #include "dap_session.h"
 #include "lua_debug.h"
 
+#include <lua.h>
 #include <lauxlib.h>
+#include "lua_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

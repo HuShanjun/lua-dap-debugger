@@ -1,5 +1,6 @@
 #include <lua.h>
 #include <lauxlib.h>
+#include "lua_compat.h"
 #include "coro_registry.h"
 #include "dap_session.h"
 
