@@ -98,6 +98,11 @@ static int walk_user_frames(lua_State *L, user_frame *frames) {
     return n;
 }
 
+int lua_debug_current_depth(lua_State *L) {
+    user_frame frames[MAX_USER_FRAMES];
+    return walk_user_frames(L, frames);
+}
+
 void lua_debug_reset_var_maps(lua_State *L) {
     size_t i;
     if (L) {
@@ -480,6 +485,31 @@ static void on_line_hook(lua_State *L, lua_Debug *ar) {
         return;
     }
     free(path);
+
+    /* Gold on_line after BP: in → next user line; over when d <= step_depth;
+     * out when d < step_depth. */
+    {
+        int mode = dap_session_step_mode();
+        if (mode == DAP_STEP_IN) {
+            dap_session_clear_step();
+            pause_loop(L, "step");
+            return;
+        }
+        if (mode == DAP_STEP_OVER) {
+            if (lua_debug_current_depth(L) <= dap_session_step_depth()) {
+                dap_session_clear_step();
+                pause_loop(L, "step");
+            }
+            return;
+        }
+        if (mode == DAP_STEP_OUT) {
+            if (lua_debug_current_depth(L) < dap_session_step_depth()) {
+                dap_session_clear_step();
+                pause_loop(L, "step");
+            }
+            return;
+        }
+    }
 }
 
 void lua_debug_install_hook(lua_State *L) {

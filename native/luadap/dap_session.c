@@ -39,7 +39,8 @@ struct dap_session {
     int close_pending;
     int hook_installed;
     int paused;
-    int step; /* 0 = none; Task 5 */
+    int step; /* DAP_STEP_* */
+    int step_depth;
     int next_ref;
     int seq;
     dap_recv_buf recv_buf;
@@ -363,11 +364,33 @@ static void handle_configuration_done(cJSON *req) {
 
 static void handle_continue(cJSON *req) {
     cJSON *body = cJSON_CreateObject();
-    g_sess.step = 0;
+    g_sess.step = DAP_STEP_NONE;
+    g_sess.step_depth = 0;
     g_sess.paused = 0;
     if (body)
         cJSON_AddBoolToObject(body, "allThreadsContinued", 1);
     send_response(req, body, 1, NULL);
+}
+
+static void handle_next(lua_State *L, cJSON *req) {
+    g_sess.step = DAP_STEP_OVER;
+    g_sess.step_depth = lua_debug_current_depth(L);
+    g_sess.paused = 0;
+    send_response(req, cJSON_CreateObject(), 1, NULL);
+}
+
+static void handle_step_in(lua_State *L, cJSON *req) {
+    g_sess.step = DAP_STEP_IN;
+    g_sess.step_depth = lua_debug_current_depth(L);
+    g_sess.paused = 0;
+    send_response(req, cJSON_CreateObject(), 1, NULL);
+}
+
+static void handle_step_out(lua_State *L, cJSON *req) {
+    g_sess.step = DAP_STEP_OUT;
+    g_sess.step_depth = lua_debug_current_depth(L);
+    g_sess.paused = 0;
+    send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
 static void handle_stack_trace(lua_State *L, cJSON *req) {
@@ -443,6 +466,12 @@ static void dispatch(lua_State *L, cJSON *msg) {
         handle_configuration_done(msg);
     else if (strcmp(cmd, "continue") == 0)
         handle_continue(msg);
+    else if (strcmp(cmd, "next") == 0)
+        handle_next(L, msg);
+    else if (strcmp(cmd, "stepIn") == 0)
+        handle_step_in(L, msg);
+    else if (strcmp(cmd, "stepOut") == 0)
+        handle_step_out(L, msg);
     else if (strcmp(cmd, "stackTrace") == 0)
         handle_stack_trace(L, msg);
     else if (strcmp(cmd, "scopes") == 0)
@@ -464,7 +493,14 @@ int dap_session_is_paused(void) { return g_sess.paused; }
 
 void dap_session_set_paused(int paused) { g_sess.paused = paused ? 1 : 0; }
 
-void dap_session_clear_step(void) { g_sess.step = 0; }
+int dap_session_step_mode(void) { return g_sess.step; }
+
+int dap_session_step_depth(void) { return g_sess.step_depth; }
+
+void dap_session_clear_step(void) {
+    g_sess.step = DAP_STEP_NONE;
+    g_sess.step_depth = 0;
+}
 
 void dap_session_reset_var_maps(lua_State *L) {
     g_sess.next_ref = 1000;
@@ -508,7 +544,8 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     g_sess.dead = 1;
     g_sess.close_pending = 0;
     g_sess.paused = 0;
-    g_sess.step = 0;
+    g_sess.step = DAP_STEP_NONE;
+    g_sess.step_depth = 0;
     g_sess.configured = 1;
     lua_debug_clear_hook(L);
     lua_debug_reset_var_maps(L);

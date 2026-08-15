@@ -7,6 +7,10 @@
 void lua_debug_install_hook(lua_State *L);
 void lua_debug_clear_hook(lua_State *L);
 
+/* Count @ user frames (skip debugger.lua / dkjson). Same baseline as gold
+ * current_depth(): handlers and on_line share this number. */
+int lua_debug_current_depth(lua_State *L);
+
 /* Drop table refs (registry) and reset allocator to 1000. Call each stop. */
 void lua_debug_reset_var_maps(lua_State *L);
 
