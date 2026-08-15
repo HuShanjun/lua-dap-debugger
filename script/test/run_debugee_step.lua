@@ -20,3 +20,4 @@ end
 
 work()
 print("DEBUGEE_DONE")
+dbg.shutdown()

@@ -17,6 +17,7 @@ local state = {
     step_depth = 0,
     paused = false,
     resume_cmd = nil,
+    dead = false,
 }
 
 local function env_host_port(host, port)
@@ -120,11 +121,46 @@ local function handle_configuration_done(req)
     state.configured = true
 end
 
-local function handle_disconnect(req)
-    send_response(req, {})
-    state.resume_cmd = "disconnect"
-    state.configured = true
+local function close_sock(sock)
+    if not sock then return end
+    pcall(function() sock:close() end)
+end
+
+-- Tear down the DAP session: optional disconnect reply, terminated event,
+-- unload hook, close sockets, clear debug state. Idempotent.
+local function shutdown_session(req)
+    if state.dead then
+        state.paused = false
+        state.configured = true
+        return
+    end
+    state.dead = true
     state.paused = false
+    state.configured = true
+    state.step = nil
+    state.step_depth = 0
+    state.resume_cmd = "disconnect"
+
+    if state.client then
+        if req then
+            pcall(send_response, req, {})
+        end
+        pcall(send_event, "terminated", {})
+    end
+
+    debug.sethook()
+
+    close_sock(state.client)
+    close_sock(state.server)
+    state.client = nil
+    state.server = nil
+    state.breakpoints = {}
+    state.var_refs = {}
+    state.next_ref = 1000
+end
+
+local function handle_disconnect(req)
+    shutdown_session(req)
 end
 
 local function is_debugger_file(source)
@@ -365,18 +401,28 @@ local function pause_loop(reason, file, line)
     state.resume_cmd = nil
     state.var_refs = {}
     state.next_ref = 1000
-    send_event("stopped", {
+    local sent = pcall(send_event, "stopped", {
         reason = reason,
         threadId = 1,
         allThreadsStopped = true,
     })
+    if not sent then
+        shutdown_session()
+        return
+    end
     while state.paused do
-        local msg = read_message()
+        local ok, msg = pcall(read_message)
+        if not ok then
+            -- Client dropped: unload hook, leave pause, let the script continue.
+            shutdown_session()
+            break
+        end
         dispatch(msg)
     end
 end
 
 local function on_line()
+    if state.dead or not state.client then return end
     -- Wrapper hook + debugger internals sit above the debugee; walk to the
     -- first non-debugger @source so getinfo(2) is not the set-hook closure.
     local info
@@ -432,6 +478,7 @@ function M.listen(host, port)
     host, port = env_host_port(host, port)
     state.host, state.port = host, port
     state.configured = false
+    state.dead = false
 
     local server, err = socket.bind(host, port)
     if not server then error("bind failed " .. host .. ":" .. port .. " " .. tostring(err)) end
@@ -446,12 +493,25 @@ function M.listen(host, port)
     print("[lua-dap] client connected")
 
     while not state.configured do
-        local msg = read_message()
+        local ok, msg = pcall(read_message)
+        if not ok then
+            shutdown_session()
+            break
+        end
         dispatch(msg)
     end
 
-    install_hook()
+    -- Disconnect during handshake must not install a hook on a dead session.
+    if state.client and not state.dead then
+        install_hook()
+    end
     return true
+end
+
+-- Host should call this after the debugee script returns so a still-connected
+-- client gets a single `terminated` event and sockets/hook are released.
+function M.shutdown()
+    shutdown_session()
 end
 
 return M

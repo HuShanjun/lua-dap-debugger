@@ -72,5 +72,10 @@ dbg.listen(host, port)
         return 1;
     }
     RunFile(lua, "E:/demo/lua-dap-debugger/script/sample/main.lua");
+    auto shutdown = lua.safe_script("require('lua-runtime.debugger').shutdown()");
+    if (!shutdown.valid()) {
+        sol::error err = shutdown;
+        std::cerr << "Debugger shutdown: " << err.what() << std::endl;
+    }
     return 0;
 }
