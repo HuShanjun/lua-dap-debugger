@@ -60,6 +60,7 @@ def main():
         assert "OPEN" in out, out
         assert "MSG" in out and "hello" in out, out
         assert "CLOSE" in out, out
+        assert "RELISTEN" in out, out
         print("asyncsocket smoke ok")
     finally:
         try:

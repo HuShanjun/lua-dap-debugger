@@ -47,3 +47,14 @@ if not saw_close then
     io.stderr:write("timeout waiting for CLOSE\n")
     os.exit(1)
 end
+
+-- Second listen must work after :close() without waiting for GC.
+s:close()
+local s2, err = asyncsocket.listen(host, port)
+if not s2 then
+    io.stderr:write("second listen failed: " .. tostring(err) .. "\n")
+    os.exit(1)
+end
+print("RELISTEN")
+io.stdout:flush()
+s2:close()

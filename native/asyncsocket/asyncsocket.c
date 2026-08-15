@@ -13,7 +13,6 @@
 #define AS_UDATA_MT "asyncsocket"
 
 static as_socket *g_impl = NULL;
-static int g_ud_ref = LUA_NOREF;
 
 static as_socket **check_ud(lua_State *L, int idx) {
     return (as_socket **)luaL_checkudata(L, idx, AS_UDATA_MT);
@@ -67,58 +66,14 @@ static void clear_global_if(as_socket *s) {
     }
 }
 
-static int sock_close(lua_State *L) {
-    as_socket **ud = check_ud(L, 1);
-    if (*ud) {
-        as_socket_stop(*ud);
-        /* keep impl until __gc so pump can still drain CLOSE */
-    }
-    return 0;
+static void registry_set_cb(lua_State *L, as_socket *s, int cb_idx) {
+    lua_pushvalue(L, cb_idx);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, s);
 }
 
-static int sock_gc(lua_State *L) {
-    as_socket **ud = check_ud(L, 1);
-    if (*ud) {
-        clear_global_if(*ud);
-        as_socket_destroy(*ud);
-        *ud = NULL;
-    }
-    if (g_ud_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, g_ud_ref);
-        g_ud_ref = LUA_NOREF;
-    }
-    return 0;
-}
-
-static int l_listen(lua_State *L) {
-    const char *host = luaL_checkstring(L, 1);
-    lua_Integer port = luaL_checkinteger(L, 2);
-    char err[256];
-    as_socket *s;
-    as_socket **ud;
-
-    if (g_impl) {
-        return luaL_error(L, "asyncsocket.listen: V1 allows only one listen");
-    }
-    err[0] = '\0';
-    s = as_socket_listen(host, (int)port, err, sizeof(err));
-    if (!s) {
-        return luaL_error(L, "asyncsocket.listen failed: %s", err[0] ? err : "unknown");
-    }
-
-    ud = (as_socket **)lua_newuserdatauv(L, sizeof(as_socket *), 1);
-    *ud = s;
-    lua_newtable(L);
-    lua_setiuservalue(L, -2, 1);
-    luaL_setmetatable(L, AS_UDATA_MT);
-
-    lua_pushvalue(L, -1);
-    if (g_ud_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, g_ud_ref);
-    }
-    g_ud_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    g_impl = s;
-    return 1;
+static void registry_clear_cb(lua_State *L, as_socket *s) {
+    lua_pushnil(L);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, s);
 }
 
 static const char *event_cb_name(as_event_type type) {
@@ -134,25 +89,13 @@ static const char *event_cb_name(as_event_type type) {
     }
 }
 
-static int l_pump(lua_State *L) {
-    as_event *evs = NULL;
-    size_t n = 0;
+static int fire_events(lua_State *L, as_event *evs, size_t n, int cbtable) {
     size_t i;
-    int cbtable;
 
-    if (!g_impl || g_ud_ref == LUA_NOREF) {
-        return 0;
-    }
-
-    evs = as_socket_take_events(g_impl, &n);
     if (!evs || n == 0) {
         as_events_free(evs, n);
         return 0;
     }
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, g_ud_ref);
-    lua_getiuservalue(L, -1, 1);
-    cbtable = lua_gettop(L);
 
     for (i = 0; i < n; i++) {
         const char *name = event_cb_name(evs[i].type);
@@ -175,8 +118,88 @@ static int l_pump(lua_State *L) {
         }
     }
     as_events_free(evs, n);
-    lua_pop(L, 2);
     return 0;
+}
+
+static void release_sock(lua_State *L, as_socket *s) {
+    registry_clear_cb(L, s);
+    clear_global_if(s);
+    as_socket_destroy(s);
+}
+
+static int sock_close(lua_State *L) {
+    as_socket **ud = check_ud(L, 1);
+    as_socket *s = *ud;
+    as_event *evs;
+    size_t n = 0;
+    int cbtable;
+
+    if (!s) {
+        return 0;
+    }
+    as_socket_stop(s);
+    evs = as_socket_take_events(s, &n);
+    lua_getiuservalue(L, 1, 1);
+    cbtable = lua_gettop(L);
+    *ud = NULL;
+    release_sock(L, s);
+    return fire_events(L, evs, n, cbtable);
+}
+
+static int sock_gc(lua_State *L) {
+    as_socket **ud = check_ud(L, 1);
+    as_socket *s = *ud;
+    if (!s) {
+        return 0;
+    }
+    *ud = NULL;
+    release_sock(L, s);
+    return 0;
+}
+
+static int l_listen(lua_State *L) {
+    const char *host = luaL_checkstring(L, 1);
+    lua_Integer port = luaL_checkinteger(L, 2);
+    char err[256];
+    as_socket *s;
+    as_socket **ud;
+
+    if (g_impl) {
+        return luaL_error(L, "asyncsocket.listen: V1 allows only one listen");
+    }
+    err[0] = '\0';
+    s = as_socket_listen(host, (int)port, err, sizeof(err));
+    if (!s) {
+        return luaL_error(L, "asyncsocket.listen failed: %s", err[0] ? err : "unknown");
+    }
+
+    ud = (as_socket **)lua_newuserdatauv(L, sizeof(as_socket *), 1);
+    *ud = s;
+    lua_newtable(L);
+    registry_set_cb(L, s, -1);
+    lua_setiuservalue(L, -2, 1);
+    luaL_setmetatable(L, AS_UDATA_MT);
+    g_impl = s;
+    return 1;
+}
+
+static int l_pump(lua_State *L) {
+    as_event *evs = NULL;
+    size_t n = 0;
+    int cbtable;
+
+    if (!g_impl) {
+        return 0;
+    }
+
+    lua_rawgetp(L, LUA_REGISTRYINDEX, g_impl);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    cbtable = lua_gettop(L);
+    evs = as_socket_take_events(g_impl, &n);
+    return fire_events(L, evs, n, cbtable);
 }
 
 static const luaL_Reg sock_methods[] = {
