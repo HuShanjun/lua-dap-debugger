@@ -167,8 +167,69 @@ local function dispatch(msg)
     end
 end
 
+local function current_depth()
+    local d = 0
+    while debug.getinfo(d + 1, "f") do
+        d = d + 1
+    end
+    return d
+end
+
+local function is_debugger_file(source)
+    if not source then return true end
+    source = normalize_path(source:sub(1, 1) == "@" and source:sub(2) or source)
+    return source:find("lua%-runtime/debugger%.lua", 1, false) ~= nil
+        or source:find("lua%-runtime/dkjson%.lua", 1, false) ~= nil
+end
+
+local function pause_loop(reason, file, line)
+    state.paused = true
+    state.resume_cmd = nil
+    state.var_refs = {}
+    state.next_ref = 1000
+    send_event("stopped", {
+        reason = reason,
+        threadId = 1,
+        allThreadsStopped = true,
+    })
+    while state.paused do
+        local msg = read_message()
+        dispatch(msg)
+    end
+end
+
+local function on_line()
+    -- Wrapper hook + debugger internals sit above the debugee; walk to the
+    -- first non-debugger @source so getinfo(2) is not the set-hook closure.
+    local info
+    local level = 2
+    while true do
+        info = debug.getinfo(level, "Sl")
+        if not info then return end
+        if info.source and info.source:sub(1, 1) == "@" and not is_debugger_file(info.source) then
+            break
+        end
+        level = level + 1
+    end
+    local file = normalize_path(info.source:sub(2))
+    local line = info.currentline
+    if line <= 0 then return end
+
+    local file_bps = state.breakpoints[file]
+    if file_bps and file_bps[line] then
+        pause_loop("breakpoint", file, line)
+        return
+    end
+
+    -- stepping filled in Task 5
+end
+
 local function install_hook()
-    -- Task 3 填充
+    debug.sethook(function(event)
+        if event == "line" then
+            on_line()
+        end
+    end, "l")
 end
 
 function M.listen(host, port)
