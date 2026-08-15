@@ -1,4 +1,4 @@
-"""DAP evaluate: watch / hover on paused locals."""
+"""DAP evaluate: watch / hover / REPL writeback / tables / failure."""
 import subprocess
 import time
 from pathlib import Path
@@ -83,11 +83,45 @@ def main():
         assert hv["success"] is True, hv
         assert hv["body"]["result"] in ("10", "10.0"), hv
 
+        c.send_request("evaluate", {
+            "expression": "x = 99",
+            "frameId": frame_id,
+            "context": "repl",
+        })
+        rp = c.wait_for(lambda m: m.get("command") == "evaluate" and m.get("type") == "response")
+        assert rp["success"] is True, rp
+
+        c.send_request("evaluate", {
+            "expression": "x",
+            "frameId": frame_id,
+            "context": "watch",
+        })
+        xv = c.wait_for(lambda m: m.get("command") == "evaluate" and m.get("type") == "response")
+        assert xv["success"] is True, xv
+        assert xv["body"]["result"] in ("99", "99.0"), xv
+
+        c.send_request("evaluate", {
+            "expression": "player",
+            "frameId": frame_id,
+            "context": "watch",
+        })
+        tb = c.wait_for(lambda m: m.get("command") == "evaluate" and m.get("type") == "response")
+        assert tb["success"] is True, tb
+        assert tb["body"]["variablesReference"] > 0, tb
+
+        c.send_request("evaluate", {
+            "expression": "@@@",
+            "context": "watch",
+            "frameId": frame_id,
+        })
+        bad = c.wait_for(lambda m: m.get("command") == "evaluate" and m.get("type") == "response")
+        assert bad["success"] is False, bad
+
         c.send_request("continue", {"threadId": 1})
         c.wait_for(lambda m: m.get("command") == "continue" and m.get("type") == "response")
         out, _ = proc.communicate(timeout=5)
         assert "DEBUGEE_DONE" in out, out
-        print("evaluate watch/hover ok")
+        print("evaluate watch/hover/repl ok")
     finally:
         try:
             proc.kill()

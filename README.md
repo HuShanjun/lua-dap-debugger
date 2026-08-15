@@ -1,6 +1,6 @@
 # Lua DAP Debugger
 
-C++ 宿主通过 **`bin/luadap.dll`** 提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员。
+C++ 宿主通过 **`bin/luadap.dll`** 提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员，以及 Watch / Hover / Debug Console（REPL，可写回 local）。
 
 DAP 协议、断点/步进/变量与拆帧全部在 **C/C++**（`native/luadap`）实现，静态链接 `asyncsocket` 与 cJSON。部署只需 **`luadap.dll`**，不需要旁路 `debugger.lua`、`dkjson.lua` 或独立 `asyncsocket.dll`。`script/lua-runtime/debugger.lua` 仅作对照参考，不参与构建与默认测试路径。
 
@@ -147,7 +147,7 @@ cmake --build E:\demo\lua-dap-debugger\build\msvc --target luadap --config Debug
 - locals：`player` / `x` / `y` / `sum`
 - 展开 `player` 可见 `name`、`stats`；再展开 `stats` 可见 `hp`、`mp`
 
-Continue / Step Over / Step Into / Step Out 可用。停止调试后宿主应继续跑完或正常退出，不应卡死。
+Continue / Step Over / Step Into / Step Out 可用。Watch 与 Hover 求值只读表达式；Debug Console（`context=repl`）可执行语句并把赋值写回 local / upvalue。停止调试后宿主应继续跑完或正常退出，不应卡死。
 
 ---
 
@@ -167,6 +167,7 @@ python script/test/test_dap_step.py
 python script/test/test_dap_disconnect.py
 python script/test/test_dap_partial_frame.py
 python script/test/test_dap_condition.py
+python script/test/test_dap_evaluate.py
 python script/test/test_dap_table_cycle.py
 python script/test/test_dap_coro_threads.py
 python script/test/test_dap_coro.py

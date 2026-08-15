@@ -27,6 +27,11 @@ typedef struct {
     int level;
 } user_frame;
 
+static int walk_user_frames(lua_State *L, user_frame *frames);
+
+#define BIND_KIND_LOCAL 1
+#define BIND_KIND_UP 2
+
 typedef struct {
     int dap_ref;
     int reg_ref;
@@ -77,13 +82,81 @@ static int find_user_line(lua_State *L, char **out_path, int *out_line,
     return 0;
 }
 
+static void bind_put(lua_State *L, int bind, const char *name, int kind, int idx) {
+    lua_createtable(L, 0, 2);
+    lua_pushinteger(L, kind);
+    lua_setfield(L, -2, "kind");
+    lua_pushinteger(L, idx);
+    lua_setfield(L, -2, "idx");
+    lua_setfield(L, bind, name);
+}
+
+/*
+ * __newindex(t, k, v). Upvalues: bind, frame_id, filled env.
+ * Existing locals live on env, so REPL uses an empty proxy as _ENV so this
+ * fires. Re-walk user frames: the eval chunk sits above the paused frame.
+ */
+static int eval_newindex(lua_State *L) {
+    user_frame frames[MAX_USER_FRAMES];
+    lua_Debug ar;
+    int frame_id;
+    int n;
+    int kind;
+    int idx;
+
+    lua_settop(L, 3);
+    lua_pushvalue(L, 2);
+    lua_gettable(L, lua_upvalueindex(1));
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "kind");
+        kind = (int)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "idx");
+        idx = (int)lua_tointeger(L, -1);
+        lua_pop(L, 2);
+
+        frame_id = (int)lua_tointeger(L, lua_upvalueindex(2));
+        n = walk_user_frames(L, frames);
+        if (frame_id >= 0 && frame_id < n &&
+            lua_getstack(L, frames[frame_id].level, &ar)) {
+            if (kind == BIND_KIND_LOCAL) {
+                lua_pushvalue(L, 3);
+                if (lua_setlocal(L, &ar, idx) == NULL)
+                    lua_pop(L, 1);
+            } else if (kind == BIND_KIND_UP) {
+                if (lua_getinfo(L, "f", &ar)) {
+                    lua_pushvalue(L, 3);
+                    if (lua_setupvalue(L, -2, idx) == NULL)
+                        lua_pop(L, 1);
+                    lua_pop(L, 1);
+                }
+            }
+        }
+    } else {
+        lua_pop(L, 1);
+        lua_pushglobaltable(L);
+        lua_pushvalue(L, 2);
+        lua_pushvalue(L, 3);
+        lua_settable(L, -3);
+        lua_pop(L, 1);
+    }
+
+    lua_pushvalue(L, 2);
+    lua_pushvalue(L, 3);
+    lua_rawset(L, lua_upvalueindex(3));
+    return 0;
+}
+
 /*
  * Frame env: locals then upvalues (local wins if already set), __index=_G.
- * No __newindex (watch/hover / BP cond are read-only). Leaves env on stack.
+ * Watch/hover / BP cond: no __newindex. REPL: empty proxy + __newindex
+ * writeback. Leaves env (or proxy) on stack.
  */
-static int push_frame_env(lua_State *L, int level) {
+static int push_frame_env(lua_State *L, int level, int frame_id,
+                          int with_newindex) {
     lua_Debug ar;
     int env;
+    int bind = 0;
     int i;
 
     if (!lua_getstack(L, level, &ar))
@@ -91,13 +164,19 @@ static int push_frame_env(lua_State *L, int level) {
 
     lua_newtable(L);
     env = lua_gettop(L);
+    if (with_newindex) {
+        lua_newtable(L);
+        bind = lua_gettop(L);
+    }
 
     for (i = 1;; i++) {
         const char *name = lua_getlocal(L, &ar, i);
         if (!name) break;
-        if (name[0] != '(')
+        if (name[0] != '(') {
+            if (bind)
+                bind_put(L, bind, name, BIND_KIND_LOCAL, i);
             lua_setfield(L, env, name);
-        else
+        } else
             lua_pop(L, 1);
     }
 
@@ -110,6 +189,8 @@ static int push_frame_env(lua_State *L, int level) {
             lua_getfield(L, env, name);
             if (lua_isnil(L, -1)) {
                 lua_pop(L, 1);
+                if (bind)
+                    bind_put(L, bind, name, BIND_KIND_UP, j);
                 lua_setfield(L, env, name);
             } else {
                 lua_pop(L, 2);
@@ -122,6 +203,21 @@ static int push_frame_env(lua_State *L, int level) {
     lua_pushglobaltable(L);
     lua_setfield(L, -2, "__index");
     lua_setmetatable(L, env);
+
+    if (with_newindex) {
+        lua_newtable(L);
+        lua_newtable(L);
+        lua_pushvalue(L, env);
+        lua_setfield(L, -2, "__index");
+        lua_pushvalue(L, bind);
+        lua_pushinteger(L, frame_id);
+        lua_pushvalue(L, env);
+        lua_pushcclosure(L, eval_newindex, 3);
+        lua_setfield(L, -2, "__newindex");
+        lua_setmetatable(L, -2);
+        lua_replace(L, env);
+        lua_pop(L, 1);
+    }
     return 1;
 }
 
@@ -143,7 +239,7 @@ static int eval_breakpoint_condition(lua_State *L, int level,
         return 1;
 
     top = lua_gettop(L);
-    if (!push_frame_env(L, level))
+    if (!push_frame_env(L, level, 0, 0))
         return 0;
     env = lua_gettop(L);
 
@@ -577,24 +673,26 @@ cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
     int n;
     int top;
     int env;
+    int is_repl;
     size_t src_n;
     char *src;
     cJSON *body;
     const char *luaerr;
 
-    (void)context;
     if (err) *err = NULL;
     if (!L)
         return eval_fail(err, "no lua state");
     if (!expression || expression[0] == '\0')
         return eval_fail(err, "expression required");
 
+    is_repl = context && strcmp(context, "repl") == 0;
+
     n = walk_user_frames(L, frames);
     if (frame_id < 0 || frame_id >= n)
         return eval_fail(err, "invalid frameId");
 
     top = lua_gettop(L);
-    if (!push_frame_env(L, frames[frame_id].level)) {
+    if (!push_frame_env(L, frames[frame_id].level, frame_id, is_repl)) {
         lua_settop(L, top);
         return eval_fail(err, "invalid frameId");
     }
@@ -608,11 +706,21 @@ cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
     }
     snprintf(src, src_n, "return (%s)", expression);
     if (luaL_loadstring(L, src) != LUA_OK) {
-        luaerr = lua_tostring(L, -1);
-        if (err) *err = xstrdup(luaerr ? luaerr : "compile error");
-        free(src);
-        lua_settop(L, top);
-        return NULL;
+        if (!is_repl) {
+            luaerr = lua_tostring(L, -1);
+            if (err) *err = xstrdup(luaerr ? luaerr : "compile error");
+            free(src);
+            lua_settop(L, top);
+            return NULL;
+        }
+        lua_pop(L, 1);
+        if (luaL_loadstring(L, expression) != LUA_OK) {
+            luaerr = lua_tostring(L, -1);
+            if (err) *err = xstrdup(luaerr ? luaerr : "compile error");
+            free(src);
+            lua_settop(L, top);
+            return NULL;
+        }
     }
     free(src);
 

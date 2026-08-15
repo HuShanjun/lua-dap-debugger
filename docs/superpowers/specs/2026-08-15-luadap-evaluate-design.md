@@ -1,7 +1,7 @@
 # luadap DAP evaluate 设计
 
 **日期：** 2026-08-15  
-**状态：** 待实现  
+**状态：** 已实现  
 **范围：** 在 C++ `luadap` 中实现 DAP `evaluate`，支持 Watch / Hover / Debug Console（REPL）；REPL 可多语句并写回 local/upvalue。
 
 **前置：**

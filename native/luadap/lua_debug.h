@@ -22,7 +22,8 @@ cJSON *lua_debug_stack_frames(lua_State *L);
 cJSON *lua_debug_collect_variables(lua_State *L, int variables_reference);
 
 /* DAP evaluate body { result, type, variablesReference }. Failure: NULL and
- * *err is malloc'd (caller frees). context watch/hover/other → return (expr). */
+ * *err is malloc'd (caller frees). watch/hover/other → return (expr). repl →
+ * return (expr) or statement chunk; assignments write back via __newindex. */
 cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
                           const char *context, char **err);
 
