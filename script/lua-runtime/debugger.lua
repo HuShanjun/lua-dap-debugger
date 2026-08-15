@@ -1,13 +1,18 @@
-local socket = require("socket")
+local asyncsocket = require("asyncsocket")
 local json = require("lua-runtime.dkjson")
+-- luasocket is optional: used only for a short sleep so listen/pause pumps
+-- do not spin the CPU. All DAP I/O goes through asyncsocket.
+local socket_ok, socket = pcall(require, "socket")
 
 local M = {}
 
 local state = {
     host = "127.0.0.1",
     port = 8172,
-    server = nil,
-    client = nil,
+    sock = nil,
+    recv_buf = "",
+    reader_coro = nil,
+    client_open = false,
     seq = 0,
     configured = false,
     breakpoints = {}, -- [norm_path] = { [line] = true }
@@ -16,9 +21,16 @@ local state = {
     step = nil, -- nil | "in" | "over" | "out"
     step_depth = 0,
     paused = false,
+    pause_thread = nil, -- main thread object while inside pause_loop
     resume_cmd = nil,
     dead = false,
 }
+
+local function short_sleep()
+    if socket_ok and socket.sleep then
+        socket.sleep(0.001)
+    end
+end
 
 local function env_host_port(host, port)
     host = host or os.getenv("LUADAP_HOST") or "127.0.0.1"
@@ -36,12 +48,12 @@ local function normalize_path(path)
 end
 
 local function send_raw(obj)
+    if not state.sock then error("send failed: no socket") end
     state.seq = state.seq + 1
     obj.seq = state.seq
     local body = json.encode(obj)
     local frame = string.format("Content-Length: %d\r\n\r\n%s", #body, body)
-    local ok, err = state.client:send(frame)
-    if not ok then error("send failed: " .. tostring(err)) end
+    state.sock:send(frame)
 end
 
 local function send_response(req, body, success, message)
@@ -63,18 +75,21 @@ local function send_event(event, body)
     })
 end
 
-local function read_message()
-    local header = ""
-    while true do
-        local line, err = state.client:receive("*l")
-        if not line then error("recv header failed: " .. tostring(err)) end
-        if line == "" then break end
-        header = header .. line .. "\n"
-    end
+-- Parse one complete DAP frame from state.recv_buf. Incomplete header/body
+-- returns nil without consuming bytes. A full header with no Content-Length
+-- or invalid JSON is a fatal error (caller / reader coro handles teardown).
+local function try_parse_one_dap_frame()
+    local buf = state.recv_buf or ""
+    local sep = buf:find("\r\n\r\n", 1, true)
+    if not sep then return nil end
+    local header = buf:sub(1, sep - 1)
     local len = header:match("[Cc]ontent%-[Ll]ength:%s*(%d+)")
     if not len then error("missing Content-Length") end
-    local body, err = state.client:receive(tonumber(len))
-    if not body then error("recv body failed: " .. tostring(err)) end
+    len = tonumber(len)
+    local body_start = sep + 4
+    if #buf < body_start + len - 1 then return nil end
+    local body = buf:sub(body_start, body_start + len - 1)
+    state.recv_buf = buf:sub(body_start + len)
     local obj, _, jerr = json.decode(body)
     if not obj then error("json decode: " .. tostring(jerr)) end
     return obj
@@ -121,13 +136,8 @@ local function handle_configuration_done(req)
     state.configured = true
 end
 
-local function close_sock(sock)
-    if not sock then return end
-    pcall(function() sock:close() end)
-end
-
 -- Tear down the DAP session: optional disconnect reply, terminated event,
--- unload hook, close sockets, clear debug state. Idempotent.
+-- unload hook, close asyncsocket, clear debug state. Idempotent.
 local function shutdown_session(req)
     if state.dead then
         state.paused = false
@@ -141,7 +151,9 @@ local function shutdown_session(req)
     state.step_depth = 0
     state.resume_cmd = "disconnect"
 
-    if state.client then
+    local sock = state.sock
+    local can_send = sock and state.client_open
+    if can_send then
         if req then
             pcall(send_response, req, {})
         end
@@ -150,10 +162,14 @@ local function shutdown_session(req)
 
     debug.sethook()
 
-    close_sock(state.client)
-    close_sock(state.server)
-    state.client = nil
-    state.server = nil
+    state.sock = nil
+    state.client_open = false
+    state.reader_coro = nil
+    state.recv_buf = ""
+    state.pause_thread = nil
+    if sock then
+        pcall(function() sock:close() end)
+    end
     state.breakpoints = {}
     state.var_refs = {}
     state.next_ref = 1000
@@ -170,13 +186,33 @@ local function is_debugger_file(source)
         or source:find("lua%-runtime/dkjson%.lua", 1, false) ~= nil
 end
 
+-- Dispatch runs in the DAP reader coroutine, so debug.getinfo/getlocal on
+-- the current stack cannot see the paused debugee. While pause_loop is on
+-- the main thread, walk that thread instead.
+local function paused_other_thread()
+    local th = state.pause_thread
+    return th and th ~= coroutine.running() and th or nil
+end
+
+local function info_at(level, what)
+    local th = paused_other_thread()
+    if th then return debug.getinfo(th, level, what) end
+    return debug.getinfo(level, what)
+end
+
+local function local_at(level, i)
+    local th = paused_other_thread()
+    if th then return debug.getlocal(th, level, i) end
+    return debug.getlocal(level, i)
+end
+
 -- Count user frames only so pause handlers and on_line share a baseline.
 -- Raw getinfo depth is larger inside pause_loop (pcall / dispatch / handler).
 local function current_depth()
     local d = 0
     local level = 1
     while true do
-        local info = debug.getinfo(level, "S")
+        local info = info_at(level, "S")
         if not info then break end
         if info.source and info.source:sub(1, 1) == "@" and not is_debugger_file(info.source) then
             d = d + 1
@@ -247,6 +283,38 @@ local function dispatch(msg)
     end
 end
 
+-- DAP reader coroutine: yield on incomplete frames; dispatch complete ones.
+-- on_message only appends recv_buf; M.update resumes this until it yields.
+local function reader_main()
+    while not state.dead do
+        local msg = try_parse_one_dap_frame()
+        if not msg then
+            coroutine.yield()
+        else
+            dispatch(msg)
+        end
+    end
+end
+
+function M.update()
+    asyncsocket.pump()
+    if state.dead then return end
+    local co = state.reader_coro
+    if not co or coroutine.status(co) == "dead" then return end
+    for _ = 1, 32 do
+        local ok, err = coroutine.resume(co)
+        if not ok then
+            shutdown_session()
+            error(err)
+        end
+        if state.dead then return end
+        if coroutine.status(co) == "suspended" then
+            break
+        end
+        if coroutine.status(co) == "dead" then break end
+    end
+end
+
 -- ref 约定：
 --   locals scope:  100000 + frameId
 --   upvalues scope:200000 + frameId
@@ -263,12 +331,16 @@ end
 
 local function walk_user_frames()
     local frames = {}
-    local level = 2 -- skip this helper
+    local cross = paused_other_thread() ~= nil
+    -- Skip this helper only when it sits on the stack being walked.
+    local level = cross and 1 or 2
     while #frames < 64 do
-        local info = debug.getinfo(level, "Snlf")
+        local info = info_at(level, "Snlf")
         if not info then break end
         if info.source and info.source:sub(1, 1) == "@" and not is_debugger_file(info.source) then
-            frames[#frames + 1] = { level = level - 1, info = info }
+            -- Same-thread: store level-1 so getlocal is relative to the caller.
+            -- Cross-thread: store the real level on the pause thread.
+            frames[#frames + 1] = { level = cross and level or (level - 1), info = info }
         end
         level = level + 1
     end
@@ -318,7 +390,7 @@ local function collect_locals(frameId)
     if not level then return out end
     local i = 1
     while true do
-        local name, value = debug.getlocal(level, i)
+        local name, value = local_at(level, i)
         if not name then break end
         if name:sub(1, 1) ~= "(" then
             out[#out + 1] = format_var(name, value)
@@ -398,6 +470,7 @@ handlers.variables = handle_variables
 
 local function pause_loop(reason, file, line)
     state.paused = true
+    state.pause_thread = coroutine.running()
     state.resume_cmd = nil
     state.var_refs = {}
     state.next_ref = 1000
@@ -411,18 +484,19 @@ local function pause_loop(reason, file, line)
         return
     end
     while state.paused do
-        local ok, msg = pcall(read_message)
+        local ok = pcall(M.update)
         if not ok then
-            -- Client dropped: unload hook, leave pause, let the script continue.
+            -- Client dropped / parse error: unload hook, leave pause.
             shutdown_session()
             break
         end
-        dispatch(msg)
+        short_sleep()
     end
+    state.pause_thread = nil
 end
 
 local function on_line()
-    if state.dead or not state.client then return end
+    if state.dead or not state.client_open then return end
     -- Wrapper hook + debugger internals sit above the debugee; walk to the
     -- first non-debugger @source so getinfo(2) is not the set-hook closure.
     local info
@@ -479,30 +553,38 @@ function M.listen(host, port)
     state.host, state.port = host, port
     state.configured = false
     state.dead = false
+    state.paused = false
+    state.client_open = false
+    state.recv_buf = ""
+    state.seq = 0
 
-    local server, err = socket.bind(host, port)
-    if not server then error("bind failed " .. host .. ":" .. port .. " " .. tostring(err)) end
-    state.server = server
+    state.sock = asyncsocket.listen(host, port)
+    state.reader_coro = coroutine.create(reader_main)
+    state.sock:on_open(function()
+        state.client_open = true
+        print("[lua-dap] client connected")
+    end)
+    -- Spec: on_message ONLY appends recv_buf; M.update resumes the reader.
+    state.sock:on_message(function(chunk)
+        state.recv_buf = state.recv_buf .. (chunk or "")
+    end)
+    state.sock:on_close(function()
+        state.client_open = false
+        shutdown_session()
+    end)
     print(string.format("[lua-dap] listening on %s:%d, waiting for VS Code debugServer...", host, port))
 
-    server:settimeout(nil)
-    local client, aerr = server:accept()
-    if not client then error("accept failed: " .. tostring(aerr)) end
-    client:settimeout(nil)
-    state.client = client
-    print("[lua-dap] client connected")
-
     while not state.configured do
-        local ok, msg = pcall(read_message)
+        local ok = pcall(M.update)
         if not ok then
             shutdown_session()
             break
         end
-        dispatch(msg)
+        short_sleep()
     end
 
     -- Disconnect during handshake must not install a hook on a dead session.
-    if state.client and not state.dead then
+    if state.client_open and not state.dead then
         install_hook()
     end
     return true
