@@ -86,6 +86,33 @@ end
 
 ---
 
+## Lua 5.1–5.4 兼容
+
+`asyncsocket` 与 `luadap` 支持 **Lua 5.1 / 5.2 / 5.3 / 5.4**（不含 LuaJIT）。默认仍是仓库内 vendored **Lua 5.4.8**（`3rd/lua-5.4.8`）。GitHub Actions 工作流 [`.github/workflows/lua-compat-matrix.yml`](.github/workflows/lua-compat-matrix.yml) 对四版本各编一次并跑最低套件（asyncsocket smoke、DAP handshake、evaluate、condition）。
+
+CMake 选项：
+
+| 选项 | 含义 |
+|------|------|
+| `-DLUA_VERSION=` | `5.1` \| `5.2` \| `5.3` \| `5.4`（默认 `5.4`） |
+| `-DLUA_ROOT=` | 可选；已安装前缀（`include/` + `lib/`）或官方风格源码树 |
+
+解析顺序：`LUA_ROOT` → 默认 5.4 vendored → 否则 FetchContent 拉取 lua.org 官方 tarball 到 **build 目录**（不进 git）。PowerShell 下请给版本号加引号，例如 `"-DLUA_VERSION=5.4"`，否则 `5.4` 会在点号处被拆开。
+
+`main`（sol2 宿主）与 `luasocket` **仅 5.4** 加入构建。非 5.4 只编 `lua` + `asyncsocket` + `luadap`；产物写到 `${CMAKE_BINARY_DIR}/bin`，避免覆盖默认的源码树 `bin/lua.exe`。
+
+```powershell
+cmake -S . -B build/msvc "-DLUA_VERSION=5.4"
+cmake --build build/msvc --target main luadap asyncsocket --config Debug
+
+cmake -S . -B build/lua51 "-DLUA_VERSION=5.1"
+cmake --build build/lua51 --target lua asyncsocket luadap --config Release
+```
+
+无网络或需固定源码时用 `-DLUA_ROOT=` 指向本机 Lua，而不是 FetchContent。
+
+---
+
 ## 快速开始（V1 真实流程）
 
 ### 1. 编译宿主
