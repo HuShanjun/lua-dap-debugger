@@ -1,7 +1,7 @@
 # asyncsocket / luadap Lua 5.1–5.4 兼容设计
 
 **日期：** 2026-08-15  
-**状态：** 已实现  
+**状态：** 已批准待验证  
 **范围：** 使 `asyncsocket` 与 `luadap` 在 Lua **5.1 / 5.2 / 5.3 / 5.4** 下可编译、可链接，并由 CI 四版本矩阵验证。
 
 **前置：**
@@ -100,9 +100,9 @@
 | `LUA_ROOT` | 可选；指向已安装/已解压的 Lua 前缀或源码树 |
 
 解析顺序：
-1. `LUA_VERSION=5.4` 且无强制外部根 → `3rd/lua-5.4.8`（现状）。  
-2. 若设 `LUA_ROOT` → 用其 headers + 库（或源码编 `liblua`）。  
-3. 否则 FetchContent（或等价）拉取对应官方发布版到 **build 目录**，编 `liblua`，**不提交进仓库**。
+1. 若设 `LUA_ROOT` → 用其 headers + 库（或源码编 `liblua`）。  
+2. `LUA_VERSION=5.4` 且 `3rd/lua-5.4.8` 存在 → vendored 树（本地开发）。  
+3. 否则 FetchContent 拉取对应官方发布版到 **build 目录**，编 `liblua`，**不提交进仓库**（含 5.4：`/3rd` 被 gitignore，CI 干净检出没有 vendored 5.4.8）。
 
 `asyncsocket` / `luadap`：include 跟随所选 Lua，并编译 `lua_compat.c`。
 

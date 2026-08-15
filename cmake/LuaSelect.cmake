@@ -2,11 +2,12 @@
 #
 # Resolution:
 #   1. LUA_ROOT set  → source tree (build) or install prefix (imported)
-#   2. LUA_VERSION=5.4 → vendored 3rd/lua-5.4.8
+#   2. LUA_VERSION=5.4 and 3rd/lua-5.4.8 present → vendored tree (local dev)
 #   3. else FetchContent official lua.org tarball into the build dir (not git)
 #
 # Do not treat 3rd/lua-5.1.5 / 5.2.4 / 5.3.6 as vendored sources (those trees
-# may contain only a CMakeLists.txt in git).
+# may contain only a CMakeLists.txt in git). 3rd/lua-5.4.8 is gitignored
+# (/3rd), so a clean CI checkout must FetchContent 5.4.8 instead of hard-fail.
 
 set(LUA_VERSION "5.4" CACHE STRING "Lua version: 5.1 5.2 5.3 5.4")
 set_property(CACHE LUA_VERSION PROPERTY STRINGS 5.1 5.2 5.3 5.4)
@@ -77,6 +78,14 @@ endfunction()
 
 set(LUA_INCLUDE_DIR "")
 
+set(_lua_vendored_54 "${CMAKE_SOURCE_DIR}/3rd/lua-5.4.8")
+set(_lua_use_vendored_54 FALSE)
+if(LUA_VERSION STREQUAL "5.4"
+        AND EXISTS "${_lua_vendored_54}/src/lapi.c"
+        AND EXISTS "${_lua_vendored_54}/CMakeLists.txt")
+    set(_lua_use_vendored_54 TRUE)
+endif()
+
 if(LUA_ROOT)
     get_filename_component(_lua_root_abs "${LUA_ROOT}" ABSOLUTE)
     if(NOT EXISTS "${_lua_root_abs}")
@@ -89,21 +98,18 @@ if(LUA_ROOT)
         message(STATUS "Lua ${LUA_VERSION}: importing prefix LUA_ROOT=${_lua_root_abs}")
         _lua_import_from_prefix("${_lua_root_abs}")
     endif()
-elseif(LUA_VERSION STREQUAL "5.4")
-    set(_vendored "${CMAKE_SOURCE_DIR}/3rd/lua-5.4.8")
-    if(NOT EXISTS "${_vendored}/src" OR NOT EXISTS "${_vendored}/CMakeLists.txt")
-        message(FATAL_ERROR "Vendored Lua 5.4.8 missing at ${_vendored}")
-    endif()
-    message(STATUS "Lua 5.4: vendored ${_vendored}")
-    add_subdirectory("${_vendored}" "${CMAKE_BINARY_DIR}/lua-5.4.8")
-    set(LUA_INCLUDE_DIR "${_vendored}/inc")
+elseif(_lua_use_vendored_54)
+    message(STATUS "Lua 5.4: vendored ${_lua_vendored_54}")
+    add_subdirectory("${_lua_vendored_54}" "${CMAKE_BINARY_DIR}/lua-5.4.8")
+    set(LUA_INCLUDE_DIR "${_lua_vendored_54}/inc")
     if(TARGET liblua)
         target_include_directories(liblua PUBLIC
-            "${_vendored}/inc"
-            "${_vendored}/src")
+            "${_lua_vendored_54}/inc"
+            "${_lua_vendored_54}/src")
     endif()
 else()
     # Directory-scope FetchContent: official tarball has no CMakeLists.
+    # Used for 5.1–5.3 always, and for 5.4 when 3rd/lua-5.4.8 is absent (CI).
     if(POLICY CMP0135)
         cmake_policy(SET CMP0135 NEW)
     endif()
