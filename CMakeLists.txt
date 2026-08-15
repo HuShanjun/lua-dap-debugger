@@ -52,6 +52,7 @@ link_directories(bin)
 add_subdirectory(3rd/lua-5.4.8)
 add_subdirectory(3rd/luasocket)
 add_subdirectory(native/asyncsocket)
+add_subdirectory(native/luadap)
 add_subdirectory(main)
 
 # luasocket's CMake omits luasocket.c, so socket.dll has no luaopen_*.
