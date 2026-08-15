@@ -79,6 +79,7 @@ def main():
             raise AssertionError(
                 "runner did not exit after DAP client disconnect:\n" + (out or "")
             )
+        assert proc.returncode == 0, (proc.returncode, out)
         assert "DEBUGEE_DONE" in out, out
         print("runner handshake ok")
     finally:
