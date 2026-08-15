@@ -106,6 +106,7 @@ struct as_socket {
     volatile int running;
     int stopped;
     int close_emitted;
+    int close_requested; /* Lua/send thread: close fd on poll thread only */
     int thread_started;
 };
 
@@ -180,15 +181,34 @@ static int enqueue_unlocked(as_socket *s, as_event_type type, const char *p, siz
 }
 
 static void emit_close_unlocked(as_socket *s) {
+    /* Poll thread or post-join only: never closesocket while WSAPoll holds fd. */
     if (s->client_fd != AS_INVALID_FD) {
         as_close_fd(s->client_fd);
         s->client_fd = AS_INVALID_FD;
     }
+    s->close_requested = 0;
     s->send_len = 0;
     s->send_off = 0;
     if (!s->close_emitted) {
         s->close_emitted = 1;
         enqueue_unlocked(s, AS_EVT_CLOSE, NULL, 0);
+    }
+}
+
+/* Lua/send thread: enqueue CLOSE and wake poll; do not closesocket here. */
+static void request_close_unlocked(as_socket *s) {
+    s->close_requested = 1;
+    s->send_len = 0;
+    s->send_off = 0;
+    if (!s->close_emitted) {
+        s->close_emitted = 1;
+        enqueue_unlocked(s, AS_EVT_CLOSE, NULL, 0);
+    }
+}
+
+static void apply_requested_close_unlocked(as_socket *s) {
+    if (s->close_requested) {
+        emit_close_unlocked(s);
     }
 }
 
@@ -277,6 +297,7 @@ static void handle_accept(as_socket *s) {
     }
     s->client_fd = c;
     s->close_emitted = 0;
+    s->close_requested = 0;
     enqueue_unlocked(s, AS_EVT_OPEN, NULL, 0);
 }
 
@@ -311,6 +332,7 @@ static void poll_loop(as_socket *s) {
         int pr;
 
         as_mutex_lock(&s->lock);
+        apply_requested_close_unlocked(s);
         if (s->listen_fd != AS_INVALID_FD) {
             i_listen = nfds;
             fds[nfds].fd = s->listen_fd;
@@ -359,6 +381,7 @@ static void poll_loop(as_socket *s) {
         }
 
         as_mutex_lock(&s->lock);
+        apply_requested_close_unlocked(s);
         if (i_wake >= 0 && (fds[i_wake].revents & POLLIN)) {
             drain_wakeup(s);
         }
@@ -656,7 +679,8 @@ int as_socket_send(as_socket *s, const void *data, size_t len) {
             p += n;
             len -= (size_t)n;
         } else if (n < 0 && !AS_WOULDBLOCK()) {
-            emit_close_unlocked(s);
+            /* Do not closesocket: poll thread may still be in WSAPoll on this fd. */
+            request_close_unlocked(s);
             fatal = 1;
         }
     }

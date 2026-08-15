@@ -28,7 +28,9 @@ as_socket *as_socket_listen(const char *host, int port, char *err, size_t errlen
 void as_socket_stop(as_socket *s);
 void as_socket_destroy(as_socket *s);
 void as_socket_wakeup(as_socket *s);
-/* Nonblocking send; leftover queued in send_buf and flushed on POLLOUT. */
+/* Nonblocking send; leftover queued in send_buf and flushed on POLLOUT.
+ * Fatal send error marks the client for close and wakes the poll thread;
+ * the poll thread removes the fd and closesocket (never from this call). */
 int as_socket_send(as_socket *s, const void *data, size_t len);
 
 /* Steal queued events. Caller must as_events_free. Poll thread never calls Lua. */

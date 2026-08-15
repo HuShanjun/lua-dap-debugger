@@ -24,6 +24,7 @@ local state = {
     pause_thread = nil, -- main thread object while inside pause_loop
     resume_cmd = nil,
     dead = false,
+    close_pending = false,
 }
 
 local function short_sleep()
@@ -145,6 +146,7 @@ local function shutdown_session(req)
         return
     end
     state.dead = true
+    state.close_pending = false
     state.paused = false
     state.configured = true
     state.step = nil
@@ -298,20 +300,30 @@ end
 
 function M.update()
     asyncsocket.pump()
-    if state.dead then return end
-    local co = state.reader_coro
-    if not co or coroutine.status(co) == "dead" then return end
-    for _ = 1, 32 do
-        local ok, err = coroutine.resume(co)
-        if not ok then
+    if not state.dead then
+        local co = state.reader_coro
+        if co and coroutine.status(co) ~= "dead" then
+            for _ = 1, 32 do
+                local ok, err = coroutine.resume(co)
+                if not ok then
+                    shutdown_session()
+                    error(err)
+                end
+                if state.dead then break end
+                if coroutine.status(co) == "suspended" then
+                    break
+                end
+                if coroutine.status(co) == "dead" then break end
+            end
+        end
+    end
+    -- CLOSE may share a pump batch with MESSAGE (e.g. disconnect + TCP FIN).
+    -- Drain the reader first so the last DAP frame is dispatched; then teardown.
+    if state.close_pending then
+        state.close_pending = false
+        if not state.dead then
             shutdown_session()
-            error(err)
         end
-        if state.dead then return end
-        if coroutine.status(co) == "suspended" then
-            break
-        end
-        if coroutine.status(co) == "dead" then break end
     end
 end
 
@@ -553,6 +565,7 @@ function M.listen(host, port)
     state.host, state.port = host, port
     state.configured = false
     state.dead = false
+    state.close_pending = false
     state.paused = false
     state.client_open = false
     state.recv_buf = ""
@@ -568,9 +581,12 @@ function M.listen(host, port)
     state.sock:on_message(function(chunk)
         state.recv_buf = state.recv_buf .. (chunk or "")
     end)
+    -- Spec: on_close only flags; M.update drains the reader, then shuts down.
+    -- Immediate shutdown here would drop a MESSAGE+CLOSE batch (no terminated).
     state.sock:on_close(function()
-        state.client_open = false
-        shutdown_session()
+        if not state.dead then
+            state.close_pending = true
+        end
     end)
     print(string.format("[lua-dap] listening on %s:%d, waiting for VS Code debugServer...", host, port))
 
