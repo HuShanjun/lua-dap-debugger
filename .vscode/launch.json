@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Lua DAP Attach (debugServer)",
+      "type": "node",
+      "request": "attach",
+      "debugServer": 8172
+    }
+  ]
+}
