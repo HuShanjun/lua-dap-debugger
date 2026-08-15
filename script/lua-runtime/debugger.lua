@@ -127,12 +127,57 @@ local function handle_disconnect(req)
     state.paused = false
 end
 
--- stubs filled in later tasks
-local function handle_continue(req) send_response(req, { allThreadsContinued = true }); state.resume_cmd = "continue"; state.step = nil; state.paused = false end
-local function handle_next(req) send_response(req, {}); state.resume_cmd = "next"; state.paused = false end
-local function handle_step_in(req) send_response(req, {}); state.resume_cmd = "stepIn"; state.paused = false end
-local function handle_step_out(req) send_response(req, {}); state.resume_cmd = "stepOut"; state.paused = false end
--- Forward-declared: real bodies sit after is_debugger_file (used by the stack walk).
+local function is_debugger_file(source)
+    if not source then return true end
+    source = normalize_path(source:sub(1, 1) == "@" and source:sub(2) or source)
+    return source:find("lua%-runtime/debugger%.lua", 1, false) ~= nil
+        or source:find("lua%-runtime/dkjson%.lua", 1, false) ~= nil
+end
+
+-- Count user frames only so pause handlers and on_line share a baseline.
+-- Raw getinfo depth is larger inside pause_loop (pcall / dispatch / handler).
+local function current_depth()
+    local d = 0
+    local level = 1
+    while true do
+        local info = debug.getinfo(level, "S")
+        if not info then break end
+        if info.source and info.source:sub(1, 1) == "@" and not is_debugger_file(info.source) then
+            d = d + 1
+        end
+        level = level + 1
+    end
+    return d
+end
+
+local function handle_continue(req)
+    state.step = nil
+    state.paused = false
+    state.resume_cmd = "continue"
+    send_response(req, { allThreadsContinued = true })
+end
+
+local function handle_next(req)
+    state.step = "over"
+    state.step_depth = current_depth()
+    state.paused = false
+    send_response(req, {})
+end
+
+local function handle_step_in(req)
+    state.step = "in"
+    state.step_depth = current_depth()
+    state.paused = false
+    send_response(req, {})
+end
+
+local function handle_step_out(req)
+    state.step = "out"
+    state.step_depth = current_depth()
+    state.paused = false
+    send_response(req, {})
+end
+-- Forward-declared: real bodies sit after walk_user_frames.
 local handle_stack_trace, handle_scopes, handle_variables
 
 local handlers = {
@@ -164,21 +209,6 @@ local function dispatch(msg)
     if not ok then
         send_response(msg, {}, false, tostring(err))
     end
-end
-
-local function current_depth()
-    local d = 0
-    while debug.getinfo(d + 1, "f") do
-        d = d + 1
-    end
-    return d
-end
-
-local function is_debugger_file(source)
-    if not source then return true end
-    source = normalize_path(source:sub(1, 1) == "@" and source:sub(2) or source)
-    return source:find("lua%-runtime/debugger%.lua", 1, false) ~= nil
-        or source:find("lua%-runtime/dkjson%.lua", 1, false) ~= nil
 end
 
 -- ref 约定：
@@ -369,7 +399,25 @@ local function on_line()
         return
     end
 
-    -- stepping filled in Task 5
+    if state.step == "in" then
+        state.step = nil
+        pause_loop("step", file, line)
+        return
+    elseif state.step == "over" then
+        local d = current_depth()
+        if d <= state.step_depth then
+            state.step = nil
+            pause_loop("step", file, line)
+        end
+        return
+    elseif state.step == "out" then
+        local d = current_depth()
+        if d < state.step_depth then
+            state.step = nil
+            pause_loop("step", file, line)
+        end
+        return
+    end
 end
 
 local function install_hook()
