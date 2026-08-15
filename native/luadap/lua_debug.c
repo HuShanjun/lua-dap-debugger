@@ -55,7 +55,8 @@ static char *xstrdup(const char *s) {
 }
 
 /* First @ user frame (skip debugger.lua / dkjson if present). */
-static int find_user_line(lua_State *L, char **out_path, int *out_line) {
+static int find_user_line(lua_State *L, char **out_path, int *out_line,
+                          int *out_level) {
     lua_Debug ar;
     int level = 0;
 
@@ -65,6 +66,7 @@ static int find_user_line(lua_State *L, char **out_path, int *out_line) {
             if (path && !is_debugger_file(path) && ar.currentline > 0) {
                 *out_path = path;
                 *out_line = ar.currentline;
+                if (out_level) *out_level = level;
                 return 1;
             }
             free(path);
@@ -72,6 +74,90 @@ static int find_user_line(lua_State *L, char **out_path, int *out_line) {
         level++;
     }
     return 0;
+}
+
+/*
+ * Gold eval_breakpoint_condition: locals then upvalues (local wins if
+ * already set), __index=_G, load "return (condition)", pcall. Compile or
+ * runtime failure → no hit. Empty/missing condition → hit.
+ * C hook: `level` is lua_getstack index of the user frame (no +1).
+ */
+static int eval_breakpoint_condition(lua_State *L, int level,
+                                     const char *condition) {
+    lua_Debug ar;
+    int top;
+    int env;
+    int i;
+    int hit;
+    size_t n;
+    char *src;
+
+    if (!condition || condition[0] == '\0')
+        return 1;
+
+    top = lua_gettop(L);
+    if (!lua_getstack(L, level, &ar))
+        return 0;
+
+    lua_newtable(L);
+    env = lua_gettop(L);
+
+    for (i = 1;; i++) {
+        const char *name = lua_getlocal(L, &ar, i);
+        if (!name) break;
+        if (name[0] != '(')
+            lua_setfield(L, env, name);
+        else
+            lua_pop(L, 1);
+    }
+
+    if (lua_getinfo(L, "f", &ar)) {
+        int func = lua_gettop(L);
+        int j;
+        for (j = 1;; j++) {
+            const char *name = lua_getupvalue(L, func, j);
+            if (!name) break;
+            lua_getfield(L, env, name);
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+                lua_setfield(L, env, name);
+            } else {
+                lua_pop(L, 2);
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    lua_newtable(L);
+    lua_pushglobaltable(L);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, env);
+
+    n = strlen(condition) + 16;
+    src = (char *)malloc(n);
+    if (!src) {
+        lua_settop(L, top);
+        return 0;
+    }
+    snprintf(src, n, "return (%s)", condition);
+    if (luaL_loadstring(L, src) != LUA_OK) {
+        free(src);
+        lua_settop(L, top);
+        return 0;
+    }
+    free(src);
+
+    lua_pushvalue(L, env);
+    if (lua_setupvalue(L, -2, 1) == NULL)
+        lua_pop(L, 1);
+
+    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+        lua_settop(L, top);
+        return 0;
+    }
+    hit = lua_toboolean(L, -1);
+    lua_settop(L, top);
+    return hit;
 }
 
 /*
@@ -473,16 +559,21 @@ static void pause_loop(lua_State *L, const char *reason) {
 static void on_line_hook(lua_State *L, lua_Debug *ar) {
     char *path = NULL;
     int line = 0;
+    int level = 0;
 
     (void)ar;
     if (dap_session_is_dead() || !dap_session_client_open())
         return;
-    if (!find_user_line(L, &path, &line))
+    if (!find_user_line(L, &path, &line, &level))
         return;
     if (dap_session_bp_should_stop(path, line)) {
-        free(path);
-        pause_loop(L, "breakpoint");
-        return;
+        const char *cond = dap_session_bp_condition(path, line);
+        if (eval_breakpoint_condition(L, level, cond)) {
+            free(path);
+            pause_loop(L, "breakpoint");
+            return;
+        }
+        /* Condition false: do not stop; still allow stepping below. */
     }
     free(path);
 

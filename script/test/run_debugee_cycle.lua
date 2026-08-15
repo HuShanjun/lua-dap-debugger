@@ -1,10 +1,12 @@
 local root = arg[1] or "."
 local port = tonumber(arg[2] or 18174)
-package.path = root .. "/script/?.lua;" .. package.path
-package.cpath = root .. "/bin/?.dll;" .. root .. "/bin/Debug/?.dll;" .. package.cpath
+root = root:gsub("\\", "/")
 
-local dbg = require("lua-runtime.debugger")
-dbg.listen("127.0.0.1", port)
+package.path = ""
+package.cpath = root .. "/bin/?.dll"
+
+local dap = require("luadap")
+dap.start("127.0.0.1", port, true)
 
 local function work()
     local shared = { tag = "shared" }
@@ -17,4 +19,4 @@ end
 
 work()
 print("DEBUGEE_DONE")
-dbg.shutdown()
+io.stdout:flush()

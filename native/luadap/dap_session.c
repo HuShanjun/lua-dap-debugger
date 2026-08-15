@@ -507,19 +507,28 @@ void dap_session_reset_var_maps(lua_State *L) {
     lua_debug_reset_var_maps(L);
 }
 
-int dap_session_bp_should_stop(const char *norm_path, int line) {
+static const dap_bp *bp_at(const char *norm_path, int line) {
     size_t i, j;
-    if (!norm_path) return 0;
+    if (!norm_path) return NULL;
     for (i = 0; i < g_sess.bp_n; i++) {
         if (!g_sess.bp_files[i].path ||
             strcmp(g_sess.bp_files[i].path, norm_path) != 0)
             continue;
         for (j = 0; j < g_sess.bp_files[i].n; j++) {
             if (g_sess.bp_files[i].items[j].line == line)
-                return 1; /* empty/missing condition → hit; skip cond eval */
+                return &g_sess.bp_files[i].items[j];
         }
     }
-    return 0;
+    return NULL;
+}
+
+int dap_session_bp_should_stop(const char *norm_path, int line) {
+    return bp_at(norm_path, line) != NULL;
+}
+
+const char *dap_session_bp_condition(const char *norm_path, int line) {
+    const dap_bp *bp = bp_at(norm_path, line);
+    return bp ? bp->condition : NULL;
 }
 
 int dap_session_send_stopped(const char *reason) {
