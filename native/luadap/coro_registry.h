@@ -12,5 +12,6 @@ void coro_registry_purge_dead(lua_State *mainL);
 int coro_registry_append_threads_json(cJSON *threads_array);
 void coro_registry_install_wrappers(lua_State *mainL);
 void coro_registry_uninstall_wrappers(lua_State *mainL);
+void coro_registry_install_hooks_all(void);
 
 #endif

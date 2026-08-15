@@ -261,6 +261,14 @@ void coro_registry_install_wrappers(lua_State *mainL) {
     g_wrapped = 1;
 }
 
+void coro_registry_install_hooks_all(void) {
+    size_t i;
+    for (i = 0; i < g_n; i++) {
+        if (g_entries[i].co)
+            lua_debug_install_hook(g_entries[i].co);
+    }
+}
+
 void coro_registry_uninstall_wrappers(lua_State *mainL) {
     if (!mainL || !g_wrapped) return;
     lua_getglobal(mainL, "coroutine");

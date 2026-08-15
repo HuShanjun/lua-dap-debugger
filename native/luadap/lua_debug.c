@@ -1,4 +1,5 @@
 #include "lua_debug.h"
+#include "coro_registry.h"
 #include "dap_session.h"
 
 #include <lauxlib.h>
@@ -539,6 +540,10 @@ cJSON *lua_debug_collect_variables(lua_State *L, int ref) {
 }
 
 static void pause_loop(lua_State *L, const char *reason) {
+    int tid = coro_registry_id_for(L);
+    if (tid == 0)
+        tid = 1;
+    dap_session_set_paused_thread(L, tid);
     dap_session_set_paused(1);
     dap_session_reset_var_maps(L);
     if (dap_session_send_stopped(reason) != 0) {

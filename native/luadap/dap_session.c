@@ -40,6 +40,8 @@ struct dap_session {
     int close_pending;
     int hook_installed;
     int paused;
+    int paused_thread_id;
+    lua_State *paused_L;
     int step; /* DAP_STEP_* */
     int step_depth;
     int next_ref;
@@ -498,6 +500,17 @@ int dap_session_is_paused(void) { return g_sess.paused; }
 
 void dap_session_set_paused(int paused) { g_sess.paused = paused ? 1 : 0; }
 
+void dap_session_set_paused_thread(lua_State *L, int thread_id) {
+    g_sess.paused_L = L;
+    g_sess.paused_thread_id = thread_id > 0 ? thread_id : 1;
+}
+
+int dap_session_paused_thread_id(void) {
+    return g_sess.paused_thread_id > 0 ? g_sess.paused_thread_id : 1;
+}
+
+lua_State *dap_session_paused_L(void) { return g_sess.paused_L; }
+
 int dap_session_step_mode(void) { return g_sess.step; }
 
 int dap_session_step_depth(void) { return g_sess.step_depth; }
@@ -540,8 +553,9 @@ int dap_session_send_stopped(const char *reason) {
     cJSON *body = cJSON_CreateObject();
     if (!body) return -1;
     if (!cJSON_AddStringToObject(body, "reason", reason ? reason : "breakpoint") ||
-        !cJSON_AddNumberToObject(body, "threadId", 1) ||
-        !cJSON_AddBoolToObject(body, "allThreadsStopped", 1)) {
+        !cJSON_AddNumberToObject(body, "threadId",
+                                 (double)dap_session_paused_thread_id()) ||
+        !cJSON_AddBoolToObject(body, "allThreadsStopped", 0)) {
         cJSON_Delete(body);
         return -1;
     }
@@ -646,6 +660,7 @@ int dap_session_update(lua_State *L) {
                !g_sess.dead) {
         lua_debug_install_hook(L);
         g_sess.hook_installed = 1;
+        coro_registry_install_hooks_all();
     }
     if (!g_sess.dead)
         coro_registry_purge_dead(L);
@@ -687,6 +702,7 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
         if (g_sess.client_open && !g_sess.dead && !g_sess.hook_installed) {
             lua_debug_install_hook(L);
             g_sess.hook_installed = 1;
+            coro_registry_install_hooks_all();
         }
     }
     return 0;
