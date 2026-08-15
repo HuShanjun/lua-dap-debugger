@@ -143,9 +143,8 @@ end
 local function handle_configuration_done(req)
     send_response(req, {})
     state.configured = true
-    if state.client_open and not state.dead then
-        install_hook()
-    end
+    -- Do not sethook here: this runs on the reader coroutine. Lua hooks are
+    -- per-thread; user code runs on the host thread that calls update/listen.
 end
 
 -- Tear down the DAP session: optional disconnect reply, terminated event,
@@ -337,6 +336,10 @@ function M.update()
         if not state.dead then
             shutdown_session()
         end
+    elseif state.configured and not state.hook_installed
+            and state.client_open and not state.dead then
+        -- Host thread (caller of update): same thread that runs debugee code.
+        install_hook()
     end
 end
 
