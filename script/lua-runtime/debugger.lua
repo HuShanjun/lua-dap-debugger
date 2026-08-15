@@ -23,6 +23,7 @@ local state = {
     resume_cmd = nil,
     dead = false,
     close_pending = false,
+    hook_installed = false,
 }
 
 local function short_sleep()
@@ -92,6 +93,8 @@ local function try_parse_one_dap_frame()
     return obj
 end
 
+local install_hook
+
 local function handle_initialize(req)
     send_response(req, {
         supportsConfigurationDoneRequest = true,
@@ -140,6 +143,9 @@ end
 local function handle_configuration_done(req)
     send_response(req, {})
     state.configured = true
+    if state.client_open and not state.dead then
+        install_hook()
+    end
 end
 
 -- Tear down the DAP session: optional disconnect reply, terminated event,
@@ -168,6 +174,7 @@ local function shutdown_session(req)
     end
 
     debug.sethook()
+    state.hook_installed = false
 
     state.sock = nil
     state.client_open = false
@@ -632,15 +639,19 @@ local function on_line()
     end
 end
 
-local function install_hook()
+local function install_hook_impl()
+    if state.hook_installed then return end
+    state.hook_installed = true
     debug.sethook(function(event)
         if event == "line" then
             on_line()
         end
     end, "l")
 end
+install_hook = install_hook_impl
 
-function M.listen(host, port)
+function M.listen(host, port, wait)
+    if wait == nil then wait = true end
     host, port = env_host_port(host, port)
     state.host, state.port = host, port
     state.configured = false
@@ -650,6 +661,7 @@ function M.listen(host, port)
     state.client_open = false
     state.recv_buf = ""
     state.seq = 0
+    state.hook_installed = false
 
     state.sock = asyncsocket.listen(host, port)
     state.reader_coro = coroutine.create(reader_main)
@@ -670,18 +682,20 @@ function M.listen(host, port)
     end)
     print(string.format("[lua-dap] listening on %s:%d, waiting for VS Code debugServer...", host, port))
 
-    while not state.configured do
-        local ok = pcall(M.update)
-        if not ok then
-            shutdown_session()
-            break
+    if wait then
+        while not state.configured do
+            local ok = pcall(M.update)
+            if not ok then
+                shutdown_session()
+                break
+            end
+            short_sleep()
         end
-        short_sleep()
-    end
 
-    -- Disconnect during handshake must not install a hook on a dead session.
-    if state.client_open and not state.dead then
-        install_hook()
+        -- Disconnect during handshake must not install a hook on a dead session.
+        if state.client_open and not state.dead then
+            install_hook()
+        end
     end
     return true
 end
