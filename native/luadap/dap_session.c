@@ -256,7 +256,7 @@ static void handle_initialize(cJSON *req) {
         cJSON_AddBoolToObject(caps, "supportsConfigurationDoneRequest", 1);
         cJSON_AddBoolToObject(caps, "supportsSetVariable", 0);
         cJSON_AddBoolToObject(caps, "supportsConditionalBreakpoints", 1);
-        cJSON_AddBoolToObject(caps, "supportsEvaluateForHovers", 0);
+        cJSON_AddBoolToObject(caps, "supportsEvaluateForHovers", 1);
     }
     send_response(req, caps, 1, NULL);
     send_event("initialized", NULL);
@@ -488,6 +488,34 @@ static void handle_variables(lua_State *L, cJSON *req) {
     send_response(req, lua_debug_collect_variables(target, ref), 1, NULL);
 }
 
+static void handle_evaluate(cJSON *req) {
+    cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
+    cJSON *exprj = args ? cJSON_GetObjectItemCaseSensitive(args, "expression") : NULL;
+    cJSON *fidj = args ? cJSON_GetObjectItemCaseSensitive(args, "frameId") : NULL;
+    cJSON *ctxj = args ? cJSON_GetObjectItemCaseSensitive(args, "context") : NULL;
+    const char *expr = (exprj && cJSON_IsString(exprj) && exprj->valuestring)
+                           ? exprj->valuestring
+                           : NULL;
+    int frame_id = (fidj && cJSON_IsNumber(fidj)) ? (int)fidj->valuedouble : 0;
+    const char *ctx = (ctxj && cJSON_IsString(ctxj) && ctxj->valuestring)
+                          ? ctxj->valuestring
+                          : "watch";
+    char *err = NULL;
+    cJSON *body;
+
+    if (!dap_session_is_paused() || !dap_session_paused_L()) {
+        send_response(req, NULL, 0, "not paused");
+        return;
+    }
+    body = lua_debug_evaluate(dap_session_paused_L(), expr, frame_id, ctx, &err);
+    if (!body) {
+        send_response(req, NULL, 0, err ? err : "evaluate failed");
+        free(err);
+        return;
+    }
+    send_response(req, body, 1, NULL);
+}
+
 static void handle_disconnect(lua_State *L, cJSON *req) {
     /* Keep listen alive so the host can accept another VS Code F5 attach. */
     dap_session_reset_client(L, req);
@@ -536,6 +564,8 @@ static void dispatch(lua_State *L, cJSON *msg) {
         handle_scopes(msg);
     else if (strcmp(cmd, "variables") == 0)
         handle_variables(L, msg);
+    else if (strcmp(cmd, "evaluate") == 0)
+        handle_evaluate(msg);
     else if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0)
         handle_disconnect(L, msg);
     else {

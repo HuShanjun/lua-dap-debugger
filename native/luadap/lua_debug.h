@@ -21,4 +21,9 @@ cJSON *lua_debug_stack_frames(lua_State *L);
  * else table object allocated this stop. */
 cJSON *lua_debug_collect_variables(lua_State *L, int variables_reference);
 
+/* DAP evaluate body { result, type, variablesReference }. Failure: NULL and
+ * *err is malloc'd (caller frees). context watch/hover/other → return (expr). */
+cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
+                          const char *context, char **err);
+
 #endif

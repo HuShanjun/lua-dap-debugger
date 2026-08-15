@@ -78,25 +78,14 @@ static int find_user_line(lua_State *L, char **out_path, int *out_line,
 }
 
 /*
- * Gold eval_breakpoint_condition: locals then upvalues (local wins if
- * already set), __index=_G, load "return (condition)", pcall. Compile or
- * runtime failure → no hit. Empty/missing condition → hit.
- * C hook: `level` is lua_getstack index of the user frame (no +1).
+ * Frame env: locals then upvalues (local wins if already set), __index=_G.
+ * No __newindex (watch/hover / BP cond are read-only). Leaves env on stack.
  */
-static int eval_breakpoint_condition(lua_State *L, int level,
-                                     const char *condition) {
+static int push_frame_env(lua_State *L, int level) {
     lua_Debug ar;
-    int top;
     int env;
     int i;
-    int hit;
-    size_t n;
-    char *src;
 
-    if (!condition || condition[0] == '\0')
-        return 1;
-
-    top = lua_gettop(L);
     if (!lua_getstack(L, level, &ar))
         return 0;
 
@@ -133,6 +122,30 @@ static int eval_breakpoint_condition(lua_State *L, int level,
     lua_pushglobaltable(L);
     lua_setfield(L, -2, "__index");
     lua_setmetatable(L, env);
+    return 1;
+}
+
+/*
+ * Gold eval_breakpoint_condition: locals then upvalues (local wins if
+ * already set), __index=_G, load "return (condition)", pcall. Compile or
+ * runtime failure → no hit. Empty/missing condition → hit.
+ * C hook: `level` is lua_getstack index of the user frame (no +1).
+ */
+static int eval_breakpoint_condition(lua_State *L, int level,
+                                     const char *condition) {
+    int top;
+    int env;
+    int hit;
+    size_t n;
+    char *src;
+
+    if (!condition || condition[0] == '\0')
+        return 1;
+
+    top = lua_gettop(L);
+    if (!push_frame_env(L, level))
+        return 0;
+    env = lua_gettop(L);
 
     n = strlen(condition) + 16;
     src = (char *)malloc(n);
@@ -536,6 +549,88 @@ cJSON *lua_debug_collect_variables(lua_State *L, int ref) {
         vars = cJSON_CreateArray();
     if (vars)
         cJSON_AddItemToObject(body, "variables", vars);
+    return body;
+}
+
+static cJSON *eval_fail(char **err, const char *msg) {
+    if (err)
+        *err = xstrdup(msg ? msg : "evaluate failed");
+    return NULL;
+}
+
+static cJSON *format_eval_body(lua_State *L, int idx) {
+    cJSON *var = format_var(L, "", idx, NULL, 0);
+    cJSON *val;
+    if (!var) return NULL;
+    cJSON_DeleteItemFromObjectCaseSensitive(var, "name");
+    val = cJSON_DetachItemFromObjectCaseSensitive(var, "value");
+    if (val)
+        cJSON_AddItemToObject(var, "result", val);
+    else
+        cJSON_AddStringToObject(var, "result", "nil");
+    return var;
+}
+
+cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
+                          const char *context, char **err) {
+    user_frame frames[MAX_USER_FRAMES];
+    int n;
+    int top;
+    int env;
+    size_t src_n;
+    char *src;
+    cJSON *body;
+    const char *luaerr;
+
+    (void)context;
+    if (err) *err = NULL;
+    if (!L)
+        return eval_fail(err, "no lua state");
+    if (!expression || expression[0] == '\0')
+        return eval_fail(err, "expression required");
+
+    n = walk_user_frames(L, frames);
+    if (frame_id < 0 || frame_id >= n)
+        return eval_fail(err, "invalid frameId");
+
+    top = lua_gettop(L);
+    if (!push_frame_env(L, frames[frame_id].level)) {
+        lua_settop(L, top);
+        return eval_fail(err, "invalid frameId");
+    }
+    env = lua_gettop(L);
+
+    src_n = strlen(expression) + 16;
+    src = (char *)malloc(src_n);
+    if (!src) {
+        lua_settop(L, top);
+        return eval_fail(err, "oom");
+    }
+    snprintf(src, src_n, "return (%s)", expression);
+    if (luaL_loadstring(L, src) != LUA_OK) {
+        luaerr = lua_tostring(L, -1);
+        if (err) *err = xstrdup(luaerr ? luaerr : "compile error");
+        free(src);
+        lua_settop(L, top);
+        return NULL;
+    }
+    free(src);
+
+    lua_pushvalue(L, env);
+    if (lua_setupvalue(L, -2, 1) == NULL)
+        lua_pop(L, 1);
+
+    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+        luaerr = lua_tostring(L, -1);
+        if (err) *err = xstrdup(luaerr ? luaerr : "runtime error");
+        lua_settop(L, top);
+        return NULL;
+    }
+
+    body = format_eval_body(L, -1);
+    lua_settop(L, top);
+    if (!body)
+        return eval_fail(err, "oom");
     return body;
 }
 
