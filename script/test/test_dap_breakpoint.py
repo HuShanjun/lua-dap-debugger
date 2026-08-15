@@ -55,6 +55,26 @@ def main():
         stopped = c.wait_for(lambda m: m.get("event") == "stopped")
         assert stopped["body"]["reason"] == "breakpoint"
 
+        c.send_request("stackTrace", {"threadId": 1})
+        st = c.wait_for(lambda m: m.get("command") == "stackTrace" and m.get("type") == "response")
+        frames = st["body"]["stackFrames"]
+        assert frames, st
+        frame_id = frames[0]["id"]
+
+        c.send_request("scopes", {"frameId": frame_id})
+        sc = c.wait_for(lambda m: m.get("command") == "scopes" and m.get("type") == "response")
+        locals_ref = sc["body"]["scopes"][0]["variablesReference"]
+
+        c.send_request("variables", {"variablesReference": locals_ref})
+        vr = c.wait_for(lambda m: m.get("command") == "variables" and m.get("type") == "response")
+        names = {v["name"]: v for v in vr["body"]["variables"]}
+        assert "x" in names and "y" in names and "player" in names, names
+        assert names["player"]["variablesReference"] > 0
+        c.send_request("variables", {"variablesReference": names["player"]["variablesReference"]})
+        pr = c.wait_for(lambda m: m.get("command") == "variables" and m.get("type") == "response")
+        pnames = {v["name"]: v for v in pr["body"]["variables"]}
+        assert "name" in pnames and "stats" in pnames, pnames
+
         c.send_request("continue", {"threadId": 1})
         c.wait_for(lambda m: m.get("command") == "continue" and m.get("type") == "response")
         out, _ = proc.communicate(timeout=5)

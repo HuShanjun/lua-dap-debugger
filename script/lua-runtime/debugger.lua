@@ -132,9 +132,8 @@ local function handle_continue(req) send_response(req, { allThreadsContinued = t
 local function handle_next(req) send_response(req, {}); state.resume_cmd = "next"; state.paused = false end
 local function handle_step_in(req) send_response(req, {}); state.resume_cmd = "stepIn"; state.paused = false end
 local function handle_step_out(req) send_response(req, {}); state.resume_cmd = "stepOut"; state.paused = false end
-local function handle_stack_trace(req) send_response(req, { stackFrames = {}, totalFrames = 0 }) end
-local function handle_scopes(req) send_response(req, { scopes = {} }) end
-local function handle_variables(req) send_response(req, { variables = {} }) end
+-- Forward-declared: real bodies sit after is_debugger_file (used by the stack walk).
+local handle_stack_trace, handle_scopes, handle_variables
 
 local handlers = {
     initialize = handle_initialize,
@@ -181,6 +180,155 @@ local function is_debugger_file(source)
     return source:find("lua%-runtime/debugger%.lua", 1, false) ~= nil
         or source:find("lua%-runtime/dkjson%.lua", 1, false) ~= nil
 end
+
+-- ref 约定：
+--   locals scope:  100000 + frameId
+--   upvalues scope:200000 + frameId
+--   table object:  state.next_ref (reset to 1000 each stop; stays < 100000)
+--
+-- Stack calibration (Task 3 + Task 4):
+-- Do NOT use debug.getinfo(2) or a blind frameId+3 offset. The set-hook
+-- wrapper plus pause_loop / dispatch / pcall sit above the debugee, and
+-- the number of debugger frames differs between stackTrace and getlocal.
+-- Reuse on_line's walk: skip debugger.lua / dkjson.lua and non-@ sources.
+-- walk_user_frames stores level-1 so getlocal/getinfo levels are relative
+-- to the *caller* of the helper (collect_locals vs handle_stack_trace).
+-- frame_id 0 = closest user frame to the pause point (work() in the test).
+
+local function walk_user_frames()
+    local frames = {}
+    local level = 2 -- skip this helper
+    while #frames < 64 do
+        local info = debug.getinfo(level, "Snlf")
+        if not info then break end
+        if info.source and info.source:sub(1, 1) == "@" and not is_debugger_file(info.source) then
+            frames[#frames + 1] = { level = level - 1, info = info }
+        end
+        level = level + 1
+    end
+    return frames
+end
+
+local function alloc_ref(value)
+    local ref = state.next_ref
+    state.next_ref = state.next_ref + 1
+    state.var_refs[ref] = value
+    return ref
+end
+
+local function format_var(name, value)
+    local t = type(value)
+    if t == "table" then
+        return {
+            name = tostring(name),
+            value = "table",
+            type = "table",
+            variablesReference = alloc_ref(value),
+        }
+    elseif t == "string" then
+        return {
+            name = tostring(name),
+            value = string.format("%q", value),
+            type = "string",
+            variablesReference = 0,
+        }
+    else
+        return {
+            name = tostring(name),
+            value = tostring(value),
+            type = t,
+            variablesReference = 0,
+        }
+    end
+end
+
+local function collect_locals(frameId)
+    -- Must call walk_user_frames from here (not via another helper) so the
+    -- stored level-1 is relative to this function, matching getlocal(level).
+    local frames = walk_user_frames()
+    local f = frames[(frameId or 0) + 1]
+    local level = f and f.level
+    local out = {}
+    if not level then return out end
+    local i = 1
+    while true do
+        local name, value = debug.getlocal(level, i)
+        if not name then break end
+        if name:sub(1, 1) ~= "(" then
+            out[#out + 1] = format_var(name, value)
+        end
+        i = i + 1
+    end
+    return out
+end
+
+local function collect_upvalues(frameId)
+    local frames = walk_user_frames()
+    local f = frames[(frameId or 0) + 1]
+    local out = {}
+    if not f or not f.info.func then return out end
+    local i = 1
+    while true do
+        local name, value = debug.getupvalue(f.info.func, i)
+        if not name then break end
+        out[#out + 1] = format_var(name, value)
+        i = i + 1
+    end
+    return out
+end
+
+local function collect_table(tbl)
+    local out = {}
+    for k, v in pairs(tbl) do
+        out[#out + 1] = format_var(k, v)
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
+
+handle_stack_trace = function(req)
+    local frames = {}
+    for i, f in ipairs(walk_user_frames()) do
+        local info = f.info
+        local path = normalize_path(info.source:sub(2))
+        frames[#frames + 1] = {
+            id = i - 1,
+            name = info.name or "?",
+            line = info.currentline or 0,
+            column = 0,
+            source = { path = path, name = path:match("([^/]+)$") },
+        }
+    end
+    send_response(req, { stackFrames = frames, totalFrames = #frames })
+end
+
+handle_scopes = function(req)
+    local frameId = (req.arguments or {}).frameId or 0
+    send_response(req, {
+        scopes = {
+            { name = "Locals", variablesReference = 100000 + frameId, expensive = false },
+            { name = "Upvalues", variablesReference = 200000 + frameId, expensive = false },
+        }
+    })
+end
+
+handle_variables = function(req)
+    local ref = (req.arguments or {}).variablesReference or 0
+    local vars
+    if ref >= 200000 and ref < 300000 then
+        vars = collect_upvalues(ref - 200000)
+    elseif ref >= 100000 and ref < 200000 then
+        vars = collect_locals(ref - 100000)
+    else
+        local tbl = state.var_refs[ref]
+        vars = (type(tbl) == "table") and collect_table(tbl) or {}
+    end
+    send_response(req, { variables = vars })
+end
+
+handlers.stackTrace = handle_stack_trace
+handlers.scopes = handle_scopes
+handlers.variables = handle_variables
 
 local function pause_loop(reason, file, line)
     state.paused = true
