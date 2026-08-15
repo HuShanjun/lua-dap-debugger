@@ -15,9 +15,8 @@
 #ifndef lua_pushglobaltable
 #define lua_pushglobaltable(L) lua_pushvalue((L), LUA_GLOBALSINDEX)
 #endif
-#ifndef luaL_checkinteger
-#define luaL_checkinteger(L, n) ((lua_Integer)luaL_checkint((L), (n)))
-#endif
+/* luaL_checkinteger is a real function in Lua 5.1 lauxlib; do not map it
+ * to luaL_checkint (that macro casts to int and would truncate). */
 /* Declarations — implemented in lua_compat.c */
 #ifndef lua_absindex
 int lua_absindex(lua_State *L, int i);
