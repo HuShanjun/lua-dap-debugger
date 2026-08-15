@@ -1,7 +1,7 @@
 # luadap.dll 封装设计（方案 A）
 
 **日期：** 2026-08-15  
-**状态：** 待确认  
+**状态：** 已批准，待实现  
 **范围：** 将现有 Lua DAP 调试器（`debugger.lua` + `dkjson` + `asyncsocket`）封装为**单一 DLL**，对外只暴露 `start` / `update`
 
 **前置：**
