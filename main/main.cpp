@@ -54,7 +54,7 @@ auto launch_dbg = R"(
 local dap = require("luadap")
 local host = os.getenv("LUADAP_HOST") or "127.0.0.1"
 local port = tonumber(os.getenv("LUADAP_PORT") or "8172")
-dap.start(host, port, true)
+dap.start(host, port, false)
 )";
 
 int main(int argc, char* args[])
