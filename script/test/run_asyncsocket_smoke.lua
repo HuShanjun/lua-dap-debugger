@@ -1,5 +1,7 @@
 -- Smoke helper for test_asyncsocket_smoke.py
 -- Usage: lua run_asyncsocket_smoke.lua <repo_root> <host> <port>
+-- Protocol tokens (Python): LISTENING, LISTENING2, OPEN, CONCAT hello, CLOSE,
+-- RELISTEN, OPEN2, CLOSE2, JOINED
 local root = arg[1]
 local host = arg[2] or "127.0.0.1"
 local port = tonumber(arg[3]) or 18221
@@ -20,6 +22,10 @@ local function sleep(sec)
         socket.sleep(sec)
         return
     end
+    if asyncsocket.sleep then
+        asyncsocket.sleep(sec)
+        return
+    end
     local until_t = os.clock() + sec
     while os.clock() < until_t do
     end
@@ -35,28 +41,28 @@ local function pump_until(pred, max_pumps)
     return pred()
 end
 
-local s = asyncsocket.listen(host, port)
+local srv = asyncsocket.listen(host, port)
 
 local received = ""
 local saw_close = false
-s:on_open(function()
+srv:on_accept(function(conn)
     print("OPEN")
     io.stdout:flush()
-end)
-s:on_message(function(chunk)
-    print("MSG " .. chunk)
-    io.stdout:flush()
-    received = received .. chunk
-    if received == "hello" then
-        print("CONCAT hello")
+    conn:on_message(function(chunk)
+        print("MSG " .. chunk)
         io.stdout:flush()
-        s:send(received)
-    end
-end)
-s:on_close(function()
-    print("CLOSE")
-    io.stdout:flush()
-    saw_close = true
+        received = received .. chunk
+        if received == "hello" then
+            print("CONCAT hello")
+            io.stdout:flush()
+            conn:send(received)
+        end
+    end)
+    conn:on_close(function()
+        print("CLOSE")
+        io.stdout:flush()
+        saw_close = true
+    end)
 end)
 
 print("LISTENING")
@@ -75,27 +81,30 @@ if received ~= "hello" then
 end
 
 -- Second listen must work after :close() without waiting for GC.
-s:close()
-local s2, err = asyncsocket.listen(host, port)
-if not s2 then
+-- srv:close() stops listen only; the inbound conn already closed.
+srv:close()
+local srv2, err = asyncsocket.listen(host, port)
+if not srv2 then
     io.stderr:write("second listen failed: " .. tostring(err) .. "\n")
     os.exit(1)
 end
 print("RELISTEN")
 io.stdout:flush()
 
--- Explicit :close() while a client is still connected: join + sync on_close.
+-- Explicit conn:close() while a client is still connected: on_close via pump.
 local opened2 = false
 local saw_close2 = false
-s2:on_open(function()
+local conn2 = nil
+srv2:on_accept(function(conn)
     print("OPEN2")
     io.stdout:flush()
     opened2 = true
-end)
-s2:on_close(function()
-    print("CLOSE2")
-    io.stdout:flush()
-    saw_close2 = true
+    conn2 = conn
+    conn:on_close(function()
+        print("CLOSE2")
+        io.stdout:flush()
+        saw_close2 = true
+    end)
 end)
 
 print("LISTENING2")
@@ -108,10 +117,13 @@ end, 2000) then
     os.exit(1)
 end
 
-s2:close()
-if not saw_close2 then
+conn2:close()
+if not pump_until(function()
+    return saw_close2
+end, 2000) then
     io.stderr:write("explicit close did not deliver on_close\n")
     os.exit(1)
 end
+srv2:close()
 print("JOINED")
 io.stdout:flush()

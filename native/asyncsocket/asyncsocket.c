@@ -6,6 +6,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <time.h>
 #endif
 
 #ifdef ASYNCSOCKET_STATIC
@@ -13,92 +15,272 @@
 #elif defined(_WIN32)
 #define ASYNCSOCKET_API __declspec(dllexport)
 #else
-#include <time.h>
 #define ASYNCSOCKET_API __attribute__((visibility("default")))
 #endif
 
-#define AS_UDATA_MT "asyncsocket"
+#define AS_SERVER_MT "asyncsocket.server"
+#define AS_CONN_MT "asyncsocket.conn"
 
-static as_socket *g_impl = NULL;
+typedef struct {
+    int alive; /* 1 while this object owns the current listen */
+} as_server_ud;
 
-static as_socket **check_ud(lua_State *L, int idx) {
-    return (as_socket **)luaL_checkudata(L, idx, AS_UDATA_MT);
+typedef struct {
+    int conn_id; /* 0 = invalidated after CLOSE */
+} as_conn_ud;
+
+static char k_conns;
+static char k_server;
+
+static void registry_get_conns(lua_State *L) {
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &k_conns);
 }
 
-static as_socket *check_sock(lua_State *L, int idx) {
-    as_socket **ud = check_ud(L, idx);
-    if (!*ud) {
-        luaL_error(L, "asyncsocket is closed");
+static void unreg_conn(lua_State *L, int conn_id) {
+    registry_get_conns(L);
+    lua_pushnil(L);
+    lua_rawseti(L, -2, conn_id);
+    lua_pop(L, 1);
+}
+
+static void set_current_server(lua_State *L, int idx) {
+    lua_pushvalue(L, idx);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &k_server);
+}
+
+static void clear_current_server_if(lua_State *L, int idx) {
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &k_server);
+    lua_pushvalue(L, idx);
+    if (lua_rawequal(L, -1, -2)) {
+        lua_pushnil(L);
+        lua_rawsetp(L, LUA_REGISTRYINDEX, &k_server);
+    }
+    lua_pop(L, 2);
+}
+
+static as_server_ud *check_server(lua_State *L, int idx) {
+    return (as_server_ud *)luaL_checkudata(L, idx, AS_SERVER_MT);
+}
+
+static as_conn_ud *check_conn(lua_State *L, int idx) {
+    as_conn_ud *ud = (as_conn_ud *)luaL_checkudata(L, idx, AS_CONN_MT);
+    if (ud->conn_id <= 0) {
+        luaL_error(L, "asyncsocket connection is closed");
         return NULL;
     }
-    return *ud;
+    return ud;
 }
 
-static void set_callback(lua_State *L, const char *name) {
-    check_ud(L, 1);
+static void set_callback(lua_State *L, int ud_idx, const char *name) {
     luaL_checktype(L, 2, LUA_TFUNCTION);
-    lua_getiuservalue(L, 1, 1);
+    lua_getiuservalue(L, ud_idx, 1);
     lua_pushvalue(L, 2);
     lua_setfield(L, -2, name);
     lua_pop(L, 1);
 }
 
-static int sock_on_open(lua_State *L) {
-    set_callback(L, "on_open");
+static void push_conn(lua_State *L, int conn_id) {
+    as_conn_ud *ud = (as_conn_ud *)lua_newuserdatauv(L, sizeof(as_conn_ud), 1);
+    ud->conn_id = conn_id;
+    lua_newtable(L);
+    lua_setiuservalue(L, -2, 1);
+    luaL_setmetatable(L, AS_CONN_MT);
+
+    registry_get_conns(L);
+    lua_pushvalue(L, -2);
+    lua_rawseti(L, -2, conn_id);
+    lua_pop(L, 1);
+}
+
+static int server_on_accept(lua_State *L) {
+    check_server(L, 1);
+    set_callback(L, 1, "on_accept");
     return 0;
 }
 
-static int sock_on_message(lua_State *L) {
-    set_callback(L, "on_message");
+static int server_close(lua_State *L) {
+    as_server_ud *ud = check_server(L, 1);
+    if (!ud->alive) {
+        return 0;
+    }
+    as_server_close();
+    ud->alive = 0;
+    clear_current_server_if(L, 1);
     return 0;
 }
 
-static int sock_on_close(lua_State *L) {
-    set_callback(L, "on_close");
+static int server_gc(lua_State *L) {
+    as_server_ud *ud = check_server(L, 1);
+    if (ud->alive) {
+        as_server_close();
+        ud->alive = 0;
+        clear_current_server_if(L, 1);
+    }
     return 0;
 }
 
-static int sock_send(lua_State *L) {
-    as_socket *s = check_sock(L, 1);
+static int conn_on_open(lua_State *L) {
+    check_conn(L, 1);
+    set_callback(L, 1, "on_open");
+    return 0;
+}
+
+static int conn_on_message(lua_State *L) {
+    check_conn(L, 1);
+    set_callback(L, 1, "on_message");
+    return 0;
+}
+
+static int conn_on_close(lua_State *L) {
+    check_conn(L, 1);
+    set_callback(L, 1, "on_close");
+    return 0;
+}
+
+static int conn_send(lua_State *L) {
+    as_conn_ud *ud = check_conn(L, 1);
     size_t len = 0;
     const char *data = luaL_checklstring(L, 2, &len);
-    if (as_socket_send(s, data, len) != 0) {
+    if (as_conn_send(ud->conn_id, data, len) != 0) {
         return luaL_error(L, "asyncsocket.send failed (no client or closed)");
     }
     return 0;
 }
 
-static void clear_global_if(as_socket *s) {
-    if (g_impl == s) {
-        g_impl = NULL;
+static int conn_close(lua_State *L) {
+    as_conn_ud *ud = (as_conn_ud *)luaL_checkudata(L, 1, AS_CONN_MT);
+    if (ud->conn_id <= 0) {
+        return 0;
     }
+    as_conn_close(ud->conn_id);
+    return 0;
 }
 
-static void registry_set_cb(lua_State *L, as_socket *s, int cb_idx) {
-    lua_pushvalue(L, cb_idx);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, s);
+static int conn_gc(lua_State *L) {
+    as_conn_ud *ud = (as_conn_ud *)luaL_checkudata(L, 1, AS_CONN_MT);
+    if (ud->conn_id > 0) {
+        as_conn_close(ud->conn_id);
+        unreg_conn(L, ud->conn_id);
+        ud->conn_id = 0;
+    }
+    return 0;
 }
 
-static void registry_clear_cb(lua_State *L, as_socket *s) {
+/* Returns 0 ok, -1 with Lua error object on stack. */
+static int dispatch_accept(lua_State *L, int conn_id) {
+    push_conn(L, conn_id);
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &k_server);
+    if (!lua_isuserdata(L, -1)) {
+        lua_pop(L, 2);
+        return 0;
+    }
+    lua_getiuservalue(L, -1, 1);
+    lua_getfield(L, -1, "on_accept");
+    lua_remove(L, -2); /* uv */
+    lua_remove(L, -2); /* server */
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2); /* fn, conn */
+        return 0;
+    }
+    lua_pushvalue(L, -2); /* conn */
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        lua_remove(L, -2); /* conn */
+        return -1;
+    }
+    lua_pop(L, 1); /* conn */
+    return 0;
+}
+
+/* Returns 0 ok, -1 with Lua error object on stack. */
+static int fire_conn_cb(lua_State *L, int conn_id, const char *name, int with_payload,
+                        const char *payload, size_t len) {
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &k_conns);
+    lua_rawgeti(L, -1, conn_id);
+    lua_remove(L, -2);
+    if (!lua_isuserdata(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    lua_getiuservalue(L, -1, 1);
+    lua_getfield(L, -1, name);
+    lua_remove(L, -2);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return 0;
+    }
+    if (with_payload) {
+        lua_pushlstring(L, payload ? payload : "", len);
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            lua_remove(L, -2);
+            return -1;
+        }
+    } else if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        lua_remove(L, -2);
+        return -1;
+    }
+    lua_pop(L, 1); /* udata */
+    return 0;
+}
+
+static void invalidate_conn_ud(lua_State *L, int conn_id) {
+    as_conn_ud *ud;
+    registry_get_conns(L);
+    lua_rawgeti(L, -1, conn_id);
+    ud = (as_conn_ud *)luaL_testudata(L, -1, AS_CONN_MT);
+    if (ud) {
+        ud->conn_id = 0;
+    }
+    lua_pop(L, 1);
     lua_pushnil(L);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, s);
+    lua_rawseti(L, -2, conn_id);
+    lua_pop(L, 1);
 }
 
-static const char *event_cb_name(as_event_type type) {
-    switch (type) {
-    case AS_EVT_OPEN:
-        return "on_open";
-    case AS_EVT_MESSAGE:
-        return "on_message";
-    case AS_EVT_CLOSE:
-        return "on_close";
-    default:
-        return NULL;
+static int dispatch_close(lua_State *L, int conn_id) {
+    int rc = fire_conn_cb(L, conn_id, "on_close", 0, NULL, 0);
+    invalidate_conn_ud(L, conn_id);
+    return rc;
+}
+
+static int l_listen(lua_State *L) {
+    const char *host = luaL_checkstring(L, 1);
+    lua_Integer port = luaL_checkinteger(L, 2);
+    char err[256];
+    as_server_ud *ud;
+
+    err[0] = '\0';
+    if (as_listen(host, (int)port, err, sizeof(err)) != 0) {
+        return luaL_error(L, "asyncsocket.listen failed: %s", err[0] ? err : "unknown");
     }
+
+    ud = (as_server_ud *)lua_newuserdatauv(L, sizeof(as_server_ud), 1);
+    ud->alive = 1;
+    lua_newtable(L);
+    lua_setiuservalue(L, -2, 1);
+    luaL_setmetatable(L, AS_SERVER_MT);
+    set_current_server(L, -1);
+    return 1;
 }
 
-static int fire_events(lua_State *L, as_event *evs, size_t n, int cbtable) {
+static int l_connect(lua_State *L) {
+    const char *host = luaL_checkstring(L, 1);
+    lua_Integer port = luaL_checkinteger(L, 2);
+    char err[256];
+    int conn_id;
+
+    err[0] = '\0';
+    conn_id = as_connect(host, (int)port, err, sizeof(err));
+    if (conn_id <= 0) {
+        return luaL_error(L, "asyncsocket.connect failed: %s", err[0] ? err : "unknown");
+    }
+    push_conn(L, conn_id);
+    return 1;
+}
+
+static int l_pump(lua_State *L) {
+    size_t n = 0;
     size_t i;
+    as_event *evs = as_take_events(&n);
 
     if (!evs || n == 0) {
         as_events_free(evs, n);
@@ -106,109 +288,30 @@ static int fire_events(lua_State *L, as_event *evs, size_t n, int cbtable) {
     }
 
     for (i = 0; i < n; i++) {
-        const char *name = event_cb_name(evs[i].type);
-        int nargs = 0;
-        if (!name) {
-            continue;
+        int rc = 0;
+        switch (evs[i].type) {
+        case AS_EVT_ACCEPT:
+            rc = dispatch_accept(L, evs[i].conn_id);
+            break;
+        case AS_EVT_OPEN:
+            rc = fire_conn_cb(L, evs[i].conn_id, "on_open", 0, NULL, 0);
+            break;
+        case AS_EVT_MESSAGE:
+            rc = fire_conn_cb(L, evs[i].conn_id, "on_message", 1, evs[i].payload, evs[i].len);
+            break;
+        case AS_EVT_CLOSE:
+            rc = dispatch_close(L, evs[i].conn_id);
+            break;
+        default:
+            break;
         }
-        lua_getfield(L, cbtable, name);
-        if (!lua_isfunction(L, -1)) {
-            lua_pop(L, 1);
-            continue;
-        }
-        if (evs[i].type == AS_EVT_MESSAGE) {
-            lua_pushlstring(L, evs[i].payload ? evs[i].payload : "", evs[i].len);
-            nargs = 1;
-        }
-        if (lua_pcall(L, nargs, 0, 0) != LUA_OK) {
+        if (rc != 0) {
             as_events_free(evs, n);
             return lua_error(L);
         }
     }
     as_events_free(evs, n);
     return 0;
-}
-
-static void release_sock(lua_State *L, as_socket *s) {
-    registry_clear_cb(L, s);
-    clear_global_if(s);
-    as_socket_destroy(s);
-}
-
-static int sock_close(lua_State *L) {
-    as_socket **ud = check_ud(L, 1);
-    as_socket *s = *ud;
-    as_event *evs;
-    size_t n = 0;
-    int cbtable;
-
-    if (!s) {
-        return 0;
-    }
-    /* stop joins the poll thread; leftover CLOSE is drained below, not via pump. */
-    as_socket_stop(s);
-    evs = as_socket_take_events(s, &n);
-    lua_getiuservalue(L, 1, 1);
-    cbtable = lua_gettop(L);
-    *ud = NULL;
-    release_sock(L, s);
-    return fire_events(L, evs, n, cbtable);
-}
-
-static int sock_gc(lua_State *L) {
-    as_socket **ud = check_ud(L, 1);
-    as_socket *s = *ud;
-    if (!s) {
-        return 0;
-    }
-    *ud = NULL;
-    release_sock(L, s);
-    return 0;
-}
-
-static int l_listen(lua_State *L) {
-    const char *host = luaL_checkstring(L, 1);
-    lua_Integer port = luaL_checkinteger(L, 2);
-    char err[256];
-    as_socket *s;
-    as_socket **ud;
-
-    if (g_impl) {
-        return luaL_error(L, "asyncsocket.listen: V1 allows only one listen");
-    }
-    err[0] = '\0';
-    s = as_socket_listen(host, (int)port, err, sizeof(err));
-    if (!s) {
-        return luaL_error(L, "asyncsocket.listen failed: %s", err[0] ? err : "unknown");
-    }
-
-    ud = (as_socket **)lua_newuserdatauv(L, sizeof(as_socket *), 1);
-    *ud = s;
-    lua_newtable(L);
-    registry_set_cb(L, s, -1);
-    lua_setiuservalue(L, -2, 1);
-    luaL_setmetatable(L, AS_UDATA_MT);
-    g_impl = s;
-    return 1;
-}
-
-static int l_pump(lua_State *L) {
-    as_event *evs = NULL;
-    size_t n = 0;
-    int cbtable;
-
-    if (!g_impl) {
-        return 0;
-    }
-
-    lua_rawgetp(L, LUA_REGISTRYINDEX, g_impl);
-    if (!lua_istable(L, -1)) {
-        lua_pop(L, 1);
-        return 0;
-    }
-    cbtable = lua_gettop(L);
-    evs = as_socket_take_events(g_impl, &n);
-    return fire_events(L, evs, n, cbtable);
 }
 
 static int l_sleep(lua_State *L) {
@@ -232,33 +335,49 @@ static int l_sleep(lua_State *L) {
     return 0;
 }
 
-static const luaL_Reg sock_methods[] = {
-    {"on_open", sock_on_open},
-    {"on_message", sock_on_message},
-    {"on_close", sock_on_close},
-    {"send", sock_send},
-    {"close", sock_close},
+static const luaL_Reg server_methods[] = {
+    {"on_accept", server_on_accept},
+    {"close", server_close},
     {NULL, NULL}
 };
+
+static const luaL_Reg conn_methods[] = {
+    {"on_open", conn_on_open},
+    {"on_message", conn_on_message},
+    {"on_close", conn_on_close},
+    {"send", conn_send},
+    {"close", conn_close},
+    {NULL, NULL}
+};
+
+static void create_mt(lua_State *L, const char *name, lua_CFunction gc, const luaL_Reg *methods) {
+    luaL_newmetatable(L, name);
+    lua_pushcfunction(L, gc);
+    lua_setfield(L, -2, "__gc");
+    lua_newtable(L);
+    luaL_setfuncs(L, methods, 0);
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1);
+}
 
 ASYNCSOCKET_API int luaopen_asyncsocket(lua_State *L) {
     if (as_net_init() != 0) {
         return luaL_error(L, "asyncsocket: WSAStartup failed");
     }
 
-    luaL_newmetatable(L, AS_UDATA_MT);
-    lua_pushcfunction(L, sock_gc);
-    lua_setfield(L, -2, "__gc");
     lua_newtable(L);
-    luaL_setfuncs(L, sock_methods, 0);
-    lua_setfield(L, -2, "__index");
-    lua_pop(L, 1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &k_conns);
+
+    create_mt(L, AS_SERVER_MT, server_gc, server_methods);
+    create_mt(L, AS_CONN_MT, conn_gc, conn_methods);
 
     lua_newtable(L);
-    lua_pushstring(L, "0.1.0");
+    lua_pushstring(L, "0.3.0");
     lua_setfield(L, -2, "_VERSION");
     lua_pushcfunction(L, l_listen);
     lua_setfield(L, -2, "listen");
+    lua_pushcfunction(L, l_connect);
+    lua_setfield(L, -2, "connect");
     lua_pushcfunction(L, l_pump);
     lua_setfield(L, -2, "pump");
     lua_pushcfunction(L, l_sleep);
