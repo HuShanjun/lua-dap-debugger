@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 add_library(luadap SHARED
     luadap.c
+    coro_registry.c
     dap_framing.c
     dap_json.c
     dap_session.c

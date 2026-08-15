@@ -1,4 +1,5 @@
 #include "dap_session.h"
+#include "coro_registry.h"
 #include "dap_framing.h"
 #include "dap_json.h"
 #include "lua_debug.h"
@@ -259,21 +260,17 @@ static void handle_attach(cJSON *req) {
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
-static void handle_threads(cJSON *req) {
+static void handle_threads(lua_State *L, cJSON *req) {
     cJSON *body = cJSON_CreateObject();
     cJSON *arr;
-    cJSON *th;
     if (!body) {
         send_response(req, NULL, 0, "oom");
         return;
     }
     arr = cJSON_AddArrayToObject(body, "threads");
-    th = cJSON_CreateObject();
-    if (th) {
-        cJSON_AddNumberToObject(th, "id", 1);
-        cJSON_AddStringToObject(th, "name", "main");
-        if (arr) cJSON_AddItemToArray(arr, th);
-        else cJSON_Delete(th);
+    if (arr) {
+        coro_registry_purge_dead(L);
+        coro_registry_append_threads_json(arr);
     }
     send_response(req, body, 1, NULL);
 }
@@ -461,7 +458,7 @@ static void dispatch(lua_State *L, cJSON *msg) {
     else if (strcmp(cmd, "attach") == 0)
         handle_attach(msg);
     else if (strcmp(cmd, "threads") == 0)
-        handle_threads(msg);
+        handle_threads(L, msg);
     else if (strcmp(cmd, "setExceptionBreakpoints") == 0)
         handle_set_exception_breakpoints(msg);
     else if (strcmp(cmd, "setBreakpoints") == 0)
@@ -494,6 +491,8 @@ static void dispatch(lua_State *L, cJSON *msg) {
 int dap_session_is_dead(void) { return g_sess.dead; }
 
 int dap_session_client_open(void) { return g_sess.client_open; }
+
+int dap_session_hooks_active(void) { return g_sess.hook_installed && !g_sess.dead; }
 
 int dap_session_is_paused(void) { return g_sess.paused; }
 
@@ -578,6 +577,8 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     lua_debug_clear_hook(L);
     lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
+    coro_registry_uninstall_wrappers(L);
+    coro_registry_clear(L);
     g_sess.client_open = 0;
     g_sess.sock = NULL;
     if (sock) {
@@ -646,6 +647,8 @@ int dap_session_update(lua_State *L) {
         lua_debug_install_hook(L);
         g_sess.hook_installed = 1;
     }
+    if (!g_sess.dead)
+        coro_registry_purge_dead(L);
     return 0;
 }
 
@@ -667,6 +670,10 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
         return -1;
     }
     fprintf(stderr, "[luadap] listening on %s:%d\n", host, port);
+
+    coro_registry_clear(L);
+    coro_registry_track(L, L, "main");
+    coro_registry_install_wrappers(L);
 
     if (wait) {
         while (!g_sess.configured && !g_sess.dead) {

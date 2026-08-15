@@ -32,6 +32,7 @@ enum {
 
 int dap_session_is_dead(void);
 int dap_session_client_open(void);
+int dap_session_hooks_active(void);
 int dap_session_is_paused(void);
 void dap_session_set_paused(int paused);
 int dap_session_step_mode(void);
