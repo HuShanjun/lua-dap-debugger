@@ -32,7 +32,29 @@ set(LUADAP_EMBED_SOURCES
     "${LUADAP_EMBED_DEBUGGER_C}"
     "${LUADAP_EMBED_DKJSON_C}")
 
-# Standalone target so the blobs can be generated before luadap.c exists.
+# Standalone target so the blobs can be generated without building the DLL.
 add_custom_target(luadap_embed
     DEPENDS ${LUADAP_EMBED_SOURCES}
     COMMENT "Generate embedded Lua C blobs for luadap")
+
+add_library(luadap SHARED
+    luadap.c
+    ${LUADAP_EMBED_SOURCES})
+add_dependencies(luadap luadap_embed)
+
+target_include_directories(luadap PRIVATE
+    ${CMAKE_SOURCE_DIR}/3rd/lua-5.4.8/inc)
+
+target_link_libraries(luadap PRIVATE asyncsocket_static liblua)
+if(WIN32)
+    # asyncsocket_static links ws2_32 PRIVATE; it does not propagate.
+    target_link_libraries(luadap PRIVATE ws2_32)
+    target_compile_definitions(luadap PRIVATE
+        WIN32_LEAN_AND_MEAN
+        _WIN32_WINNT=0x0600
+        _CRT_SECURE_NO_WARNINGS)
+endif()
+
+set_target_properties(luadap PROPERTIES
+    OUTPUT_NAME "luadap"
+    PREFIX "")
