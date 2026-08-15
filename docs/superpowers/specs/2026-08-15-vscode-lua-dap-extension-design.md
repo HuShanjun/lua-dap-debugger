@@ -1,7 +1,7 @@
 # VS Code 通用 lua-dap 扩展设计
 
 **日期：** 2026-08-15  
-**状态：** 已批准待实现  
+**状态：** 已实现  
 **范围：** 将现有 C `luadap` DAP 后端封装为可安装的 VS Code 调试扩展，支持 **Launch 单文件**（经 `lua-runner`）与 **Attach 到已 listen 的端口**。
 
 **前置：**

@@ -1,12 +1,13 @@
 # Lua DAP Debugger
 
-C++ 宿主通过 **`bin/luadap.dll`** 提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务；VS Code 用内置 `debugServer` 直连，即可断点、步进、查看 locals / table 成员，以及 Watch / Hover / Debug Console（REPL，可写回 local）。
+C++ **`luadap`** 提供标准 [DAP](https://microsoft.github.io/debug-adapter-protocol/) TCP 服务（断点、步进、locals / table、Watch / Hover / Debug Console REPL）。VS Code 通过本仓库的 **`lua-dap` 扩展** 连接：
 
-DAP 协议、断点/步进/变量与拆帧全部在 **C/C++**（`native/luadap`）实现，静态链接 `asyncsocket` 与 cJSON。部署只需 **`luadap.dll`**，不需要旁路 `debugger.lua`、`dkjson.lua` 或独立 `asyncsocket.dll`。`script/lua-runtime/debugger.lua` 仅作对照参考，不参与构建与默认测试路径。
+- **Launch：** 扩展拉起 **`lua-runner`**（已链接 Lua + `luadap`），调试当前 `.lua` 文件。不依赖系统 `lua.exe` 与 `luadap.dll` 的 ABI 是否匹配。
+- **Attach：** 连到已调用 `dap.start` 的进程端口。游戏 / 自定义宿主仍须自行嵌入 `luadap`（通常 `bin/luadap.dll` + `require("luadap")`），并在主循环调用 `dap.update()`。
 
-宿主在主循环中调用 **`dap.update()`**（泵网络事件、拆帧、dispatch），以便运行中处理 disconnect 等事件。
+DAP 协议、断点/步进/变量与拆帧全部在 **C/C++**（`native/luadap`）实现。`script/lua-runtime/debugger.lua` 仅作对照参考，不参与构建与默认测试路径。
 
-V1 **不需要** `vscode-extension/`（可保留但不参与调试流程）。
+旧的 `type: node` + `debugServer` 配置已废弃，请改用 `type: lua-dap`。
 
 ---
 
@@ -14,17 +15,19 @@ V1 **不需要** `vscode-extension/`（可保留但不参与调试流程）。
 
 ```
 lua-dap-debugger/
-├── main/main.cpp                 # 宿主：luadap.start → sample → 循环 dap.update()
+├── main/main.cpp                 # 示例宿主：luadap.start → sample → 循环 dap.update()
+├── tools/lua-runner/             # Launch 用 CLI：链接 liblua + luadap
 ├── native/luadap/                # C++ DAP：framing / session / lua_debug
 ├── native/asyncsocket/           # 异步 TCP（poll 线程；luadap 静态链接）
-├── 3rd/cJSON/                    # 编进 luadap.dll
+├── vscode-extension/             # type: lua-dap（Launch spawn runner / Attach 端口）
+├── 3rd/cJSON/                    # 编进 luadap
 ├── script/lua-runtime/
 │   ├── debugger.lua              # 对照参考（非运行时）
 │   └── dkjson.lua
 ├── script/sample/main.lua        # 演示 locals + nested table
-├── script/test/                  # Python DAP 回归（全部 require("luadap")）
-├── bin/                          # 编译产物：main.exe、luadap.dll、lua.exe
-└── .vscode/launch.json           # type: node + debugServer: 8172
+├── script/test/                  # Python DAP 回归
+├── bin/                          # 编译产物：lua-runner.exe、main.exe、luadap.dll、lua.exe
+└── .vscode/launch.json           # type: lua-dap（Launch / Attach）+ Extension Host
 ```
 
 ---
@@ -113,61 +116,57 @@ cmake --build build/lua51 --target lua asyncsocket luadap --config Release
 
 ---
 
-## 快速开始（V1 真实流程）
+## 快速开始（lua-dap 扩展）
 
-### 1. 编译宿主
-
-用仓库已有的 CMake / MSVC 流程编译，确保以下文件可用：
-
-- `bin/main.exe`
-- `bin/luadap.dll`（`require("luadap")`）
-
-示例（本机已配置过 `build/msvc` 时）：
+### 1. 编译 `lua-runner`（及可选宿主）
 
 ```powershell
-cmake --build E:\demo\lua-dap-debugger\build\msvc --target main --config Debug
-cmake --build E:\demo\lua-dap-debugger\build\msvc --target luadap --config Debug
+cmake --build E:\demo\lua-dap-debugger\build\msvc --target lua-runner --config Debug
 ```
 
-默认端口 `8172`，可用环境变量 `LUADAP_HOST` / `LUADAP_PORT` 覆盖。
+产物：`bin/lua-runner.exe`。CMake POST_BUILD 会复制到 `vscode-extension/bin/win32-x64/lua-runner.exe`（该路径 gitignore，干净克隆后必须编一次）。也可手动：
 
-### 2. 先启动宿主
+```powershell
+powershell -File vscode-extension/scripts/copy-runner.ps1
+```
+
+Attach 示例宿主另编 `main` + `luadap`：
+
+```powershell
+cmake --build E:\demo\lua-dap-debugger\build\msvc --target main luadap --config Debug
+```
+
+`lua-runner` CLI：`lua-runner [--host HOST] [--port PORT] [--] <program.lua> [script_args...]`
+
+### 2. 编译扩展
+
+```powershell
+cd vscode-extension
+npm install
+npm run compile
+```
+
+本仓库调试：在 VS Code 打开本仓库，选 **Extension Host: lua-dap** 再 F5，会在 Extension Development Host 中加载 `vscode-extension/`。其它工作区：把扩展目录拷到 VS Code extensions，或设 `luadap.runnerPath` 指向自编的 `lua-runner`。
+
+Runner 解析顺序：launch 的 `runnerPath` → 设置 `luadap.runnerPath` → 扩展内置 `bin/win32-x64/lua-runner.exe`。仓库 `.vscode/launch.json` 的 Launch 配置显式指向 `${workspaceFolder}/bin/lua-runner.exe`。
+
+### 3. Launch 当前文件
+
+在 Extension Development Host（或已安装扩展的窗口）打开要调试的 `.lua`，F5 选 **Lua DAP: Launch current file**。扩展会选空闲端口、spawn runner、等 listen 后再连 DAP。
+
+Launch **不再**需要系统 `lua.exe` 与 `luadap.dll` ABI 一致；runner 自带匹配的 liblua 并静态链接 `luadap`。
+
+### 4. Attach 到已 listen 的宿主
+
+宿主仍须嵌入 `luadap` 并泵事件（与 `main/main.cpp` 相同）：
 
 ```powershell
 .\bin\main.exe
 ```
 
-控制台应出现类似：
+默认端口 `8172`（`LUADAP_HOST` / `LUADAP_PORT` 可覆盖）。控制台出现 listening 后，F5 选 **Lua DAP: Attach**（`127.0.0.1:8172`）。Attach **不**使用 `lua-runner`。
 
-```
-[lua-dap] listening on 127.0.0.1:8172, waiting for VS Code debugServer...
-```
-
-`start(..., true)` 内部泵事件，直到 DAP 握手完成（`configurationDone`），**然后**才执行 `script/sample/main.lua`。
-
-### 3. VS Code 附加
-
-用 VS Code 打开本仓库，按 **F5**，选择 **Lua DAP Attach (debugServer)**。
-
-配置在 `.vscode/launch.json`：
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Lua DAP Attach (debugServer)",
-      "type": "node",
-      "request": "attach",
-      "debugServer": 8172
-    }
-  ]
-}
-```
-
-`type: "node"` 只是为了复用 VS Code 内置 DAP 客户端；没有 Node 调试器逻辑。握手成功后 sample 开始执行。
-
-### 4. 断点与变量
+### 5. 断点与变量
 
 在 `script/sample/main.lua` 的 `local sum = add(x, y)` 一行打断点，查看 Variables：
 
@@ -175,6 +174,31 @@ cmake --build E:\demo\lua-dap-debugger\build\msvc --target luadap --config Debug
 - 展开 `player` 可见 `name`、`stats`；再展开 `stats` 可见 `hp`、`mp`
 
 Continue / Step Over / Step Into / Step Out 可用。Watch 与 Hover 求值只读表达式；Debug Console（`context=repl`）可执行语句并把赋值写回 local / upvalue。停止调试后宿主应继续跑完或正常退出，不应卡死。
+
+仓库 `.vscode/launch.json`（旧 `type: node` + `debugServer` 已删除）：
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Lua DAP: Launch current file",
+      "type": "lua-dap",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "runnerPath": "${workspaceFolder}/bin/lua-runner.exe"
+    },
+    {
+      "name": "Lua DAP: Attach",
+      "type": "lua-dap",
+      "request": "attach",
+      "host": "127.0.0.1",
+      "port": 8172
+    }
+  ]
+}
+```
 
 ---
 
@@ -209,5 +233,7 @@ python script/test/test_dap_coro.py
 - 已 strip debug info 的字节码看不到变量；LuaJIT `-O2` 下部分 local 可能被优化
 - V1 不做 pathMappings（同机路径规范化即可）
 - 协程映射为 DAP threads：`start` 时包装 `coroutine.create` / `coroutine.wrap`；绕过包装的创建需 `dap.track(co, name?)`。未暂停协程的 `stackTrace` 为空栈。本轮不做 DAP `pause` 请求。
-- `vscode-extension/` 为历史目录，V1 非必需
+- 扩展内置 `lua-runner.exe` gitignore；干净克隆须先编 `lua-runner`（或 `copy-runner.ps1`）再 Launch
+- 非 Windows 无预编译 runner，须自编并配置 `runnerPath` / `luadap.runnerPath`
 - `luadap` 不导出 `shutdown`；进程退出由宿主负责
+- 已废弃：`type: node` + `debugServer`（请用 `type: lua-dap`）

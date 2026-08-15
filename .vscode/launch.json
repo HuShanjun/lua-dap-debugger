@@ -2,10 +2,30 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Lua DAP Attach (debugServer)",
-      "type": "node",
+      "name": "Extension Host: lua-dap",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/vscode-extension"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/vscode-extension/out/**/*.js"
+      ]
+    },
+    {
+      "name": "Lua DAP: Launch current file",
+      "type": "lua-dap",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "runnerPath": "${workspaceFolder}/bin/lua-runner.exe"
+    },
+    {
+      "name": "Lua DAP: Attach",
+      "type": "lua-dap",
       "request": "attach",
-      "debugServer": 8172
+      "host": "127.0.0.1",
+      "port": 8172
     }
   ]
 }
