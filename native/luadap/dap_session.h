@@ -40,6 +40,7 @@ int dap_session_paused_thread_id(void);
 lua_State *dap_session_paused_L(void);
 int dap_session_step_mode(void);
 int dap_session_step_depth(void);
+lua_State *dap_session_step_L(void);
 void dap_session_clear_step(void);
 void dap_session_reset_var_maps(lua_State *L);
 int dap_session_send_stopped(const char *reason);

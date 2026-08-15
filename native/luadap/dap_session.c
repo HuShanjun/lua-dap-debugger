@@ -44,6 +44,7 @@ struct dap_session {
     lua_State *paused_L;
     int step; /* DAP_STEP_* */
     int step_depth;
+    lua_State *step_L;
     int next_ref;
     int seq;
     dap_recv_buf recv_buf;
@@ -361,10 +362,25 @@ static void handle_configuration_done(cJSON *req) {
     /* Do not install the hook here: host thread update/wait installs it. */
 }
 
+static lua_State *step_target_L(lua_State *L) {
+    lua_State *pl = dap_session_paused_L();
+    return pl ? pl : L;
+}
+
 static void handle_continue(cJSON *req) {
-    cJSON *body = cJSON_CreateObject();
+    cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
+    cJSON *tidj = args ? cJSON_GetObjectItemCaseSensitive(args, "threadId") : NULL;
+    cJSON *body;
+
+    if (tidj && cJSON_IsNumber(tidj) &&
+        (int)tidj->valuedouble != dap_session_paused_thread_id()) {
+        send_response(req, NULL, 0, "thread not paused");
+        return;
+    }
+    body = cJSON_CreateObject();
     g_sess.step = DAP_STEP_NONE;
     g_sess.step_depth = 0;
+    g_sess.step_L = NULL;
     g_sess.paused = 0;
     if (body)
         cJSON_AddBoolToObject(body, "allThreadsContinued", 1);
@@ -372,28 +388,54 @@ static void handle_continue(cJSON *req) {
 }
 
 static void handle_next(lua_State *L, cJSON *req) {
+    lua_State *target = step_target_L(L);
     g_sess.step = DAP_STEP_OVER;
-    g_sess.step_depth = lua_debug_current_depth(L);
+    g_sess.step_depth = lua_debug_current_depth(target);
+    g_sess.step_L = target;
     g_sess.paused = 0;
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
 static void handle_step_in(lua_State *L, cJSON *req) {
+    lua_State *target = step_target_L(L);
     g_sess.step = DAP_STEP_IN;
-    g_sess.step_depth = lua_debug_current_depth(L);
+    g_sess.step_depth = lua_debug_current_depth(target);
+    g_sess.step_L = target;
     g_sess.paused = 0;
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
 static void handle_step_out(lua_State *L, cJSON *req) {
+    lua_State *target = step_target_L(L);
     g_sess.step = DAP_STEP_OUT;
-    g_sess.step_depth = lua_debug_current_depth(L);
+    g_sess.step_depth = lua_debug_current_depth(target);
+    g_sess.step_L = target;
     g_sess.paused = 0;
     send_response(req, cJSON_CreateObject(), 1, NULL);
 }
 
 static void handle_stack_trace(lua_State *L, cJSON *req) {
-    send_response(req, lua_debug_stack_frames(L), 1, NULL);
+    cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
+    cJSON *tidj = args ? cJSON_GetObjectItemCaseSensitive(args, "threadId") : NULL;
+    int tid = (tidj && cJSON_IsNumber(tidj)) ? (int)tidj->valuedouble : 1;
+    lua_State *target = coro_registry_state_for(tid);
+    cJSON *body;
+
+    (void)L;
+    if (!target) {
+        send_response(req, NULL, 0, "unknown thread");
+        return;
+    }
+    if (!dap_session_is_paused() || tid != dap_session_paused_thread_id()) {
+        body = cJSON_CreateObject();
+        if (body) {
+            cJSON_AddArrayToObject(body, "stackFrames");
+            cJSON_AddNumberToObject(body, "totalFrames", 0);
+        }
+        send_response(req, body, 1, NULL);
+        return;
+    }
+    send_response(req, lua_debug_stack_frames(dap_session_paused_L()), 1, NULL);
 }
 
 static void handle_scopes(cJSON *req) {
@@ -431,7 +473,10 @@ static void handle_variables(lua_State *L, cJSON *req) {
     cJSON *refj = args ? cJSON_GetObjectItemCaseSensitive(args, "variablesReference")
                        : NULL;
     int ref = (refj && cJSON_IsNumber(refj)) ? (int)refj->valuedouble : 0;
-    send_response(req, lua_debug_collect_variables(L, ref), 1, NULL);
+    lua_State *target = (dap_session_is_paused() && dap_session_paused_L())
+                            ? dap_session_paused_L()
+                            : L;
+    send_response(req, lua_debug_collect_variables(target, ref), 1, NULL);
 }
 
 static void handle_disconnect(lua_State *L, cJSON *req) {
@@ -515,9 +560,12 @@ int dap_session_step_mode(void) { return g_sess.step; }
 
 int dap_session_step_depth(void) { return g_sess.step_depth; }
 
+lua_State *dap_session_step_L(void) { return g_sess.step_L; }
+
 void dap_session_clear_step(void) {
     g_sess.step = DAP_STEP_NONE;
     g_sess.step_depth = 0;
+    g_sess.step_L = NULL;
 }
 
 void dap_session_reset_var_maps(lua_State *L) {
@@ -576,6 +624,7 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     g_sess.paused = 0;
     g_sess.step = DAP_STEP_NONE;
     g_sess.step_depth = 0;
+    g_sess.step_L = NULL;
     g_sess.configured = 1;
 
     /* Gold: reply + terminated while the client is still marked open, then

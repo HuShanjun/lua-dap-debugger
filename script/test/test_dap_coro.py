@@ -104,6 +104,44 @@ def main():
         assert "main" in names, threads
         assert tid in ids, threads
 
+        c.send_request("stackTrace", {"threadId": tid})
+        st = c.wait_for(
+            lambda m: m.get("type") == "response" and m.get("command") == "stackTrace"
+        )
+        assert st.get("success") is True, st
+        frames = (st.get("body") or {}).get("stackFrames") or []
+        assert frames, st
+        dbg_name = DEBUGEE.name.lower()
+        paths = [
+            ((f.get("source") or {}).get("path") or "").replace("\\", "/").lower()
+            for f in frames
+        ]
+        assert any(dbg_name in p for p in paths), (DEBUGEE, frames)
+
+        c.send_request("stackTrace", {"threadId": 1})
+        st_main = c.wait_for(
+            lambda m: m.get("type") == "response" and m.get("command") == "stackTrace"
+        )
+        assert st_main.get("success") is True, st_main
+        assert (st_main.get("body") or {}).get("stackFrames") == [], st_main
+
+        frame_id = frames[0]["id"]
+        c.send_request("scopes", {"frameId": frame_id})
+        sc = c.wait_for(
+            lambda m: m.get("type") == "response" and m.get("command") == "scopes"
+        )
+        locals_ref = ((sc.get("body") or {}).get("scopes") or [{}])[0].get(
+            "variablesReference"
+        )
+        c.send_request("variables", {"variablesReference": locals_ref})
+        vr = c.wait_for(
+            lambda m: m.get("type") == "response" and m.get("command") == "variables"
+        )
+        names = {
+            v["name"]: v for v in ((vr.get("body") or {}).get("variables") or [])
+        }
+        assert "a" in names or "b" in names, names
+
         c.send_request("continue", {"threadId": tid})
         c.wait_for(
             lambda m: m.get("type") == "response" and m.get("command") == "continue"

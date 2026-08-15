@@ -583,9 +583,11 @@ static void on_line_hook(lua_State *L, lua_Debug *ar) {
     free(path);
 
     /* Gold on_line after BP: in → next user line; over when d <= step_depth;
-     * out when d < step_depth. */
+     * out when d < step_depth. Step is bound to the paused coroutine. */
     {
         int mode = dap_session_step_mode();
+        if (mode != DAP_STEP_NONE && L != dap_session_step_L())
+            return;
         if (mode == DAP_STEP_IN) {
             dap_session_clear_step();
             pause_loop(L, "step");
