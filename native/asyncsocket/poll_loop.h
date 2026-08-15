@@ -24,9 +24,11 @@ typedef struct as_socket as_socket;
 int as_net_init(void);
 
 as_socket *as_socket_listen(const char *host, int port, char *err, size_t errlen);
+/* running=0, wakeup, join poll thread, close fds; enqueue CLOSE if client was up. */
 void as_socket_stop(as_socket *s);
 void as_socket_destroy(as_socket *s);
 void as_socket_wakeup(as_socket *s);
+/* Nonblocking send; leftover queued in send_buf and flushed on POLLOUT. */
 int as_socket_send(as_socket *s, const void *data, size_t len);
 
 /* Steal queued events. Caller must as_events_free. Poll thread never calls Lua. */

@@ -13,8 +13,31 @@ package.path = root .. "/script/?.lua;" .. package.path
 package.cpath = root .. "/bin/?.dll;" .. root .. "/bin/Debug/?.dll;" .. package.cpath
 
 local asyncsocket = require("asyncsocket")
+local ok_sleep, socket = pcall(require, "socket")
+
+local function sleep(sec)
+    if ok_sleep then
+        socket.sleep(sec)
+        return
+    end
+    local until_t = os.clock() + sec
+    while os.clock() < until_t do
+    end
+end
+
+local function pump_until(pred, max_pumps)
+    local pumps = 0
+    while not pred() and pumps < max_pumps do
+        asyncsocket.pump()
+        pumps = pumps + 1
+        sleep(0.01)
+    end
+    return pred()
+end
+
 local s = asyncsocket.listen(host, port)
 
+local received = ""
 local saw_close = false
 s:on_open(function()
     print("OPEN")
@@ -23,6 +46,12 @@ end)
 s:on_message(function(chunk)
     print("MSG " .. chunk)
     io.stdout:flush()
+    received = received .. chunk
+    if received == "hello" then
+        print("CONCAT hello")
+        io.stdout:flush()
+        s:send(received)
+    end
 end)
 s:on_close(function()
     print("CLOSE")
@@ -33,18 +62,15 @@ end)
 print("LISTENING")
 io.stdout:flush()
 
-local ok_sleep, socket = pcall(require, "socket")
-local pumps = 0
-while not saw_close and pumps < 2000 do
-    asyncsocket.pump()
-    pumps = pumps + 1
-    if ok_sleep then
-        socket.sleep(0.01)
-    end
+if not pump_until(function()
+    return saw_close
+end, 2000) then
+    io.stderr:write("timeout waiting for CLOSE\n")
+    os.exit(1)
 end
 
-if not saw_close then
-    io.stderr:write("timeout waiting for CLOSE\n")
+if received ~= "hello" then
+    io.stderr:write("expected concatenated hello, got: " .. received .. "\n")
     os.exit(1)
 end
 
@@ -57,4 +83,35 @@ if not s2 then
 end
 print("RELISTEN")
 io.stdout:flush()
+
+-- Explicit :close() while a client is still connected: join + sync on_close.
+local opened2 = false
+local saw_close2 = false
+s2:on_open(function()
+    print("OPEN2")
+    io.stdout:flush()
+    opened2 = true
+end)
+s2:on_close(function()
+    print("CLOSE2")
+    io.stdout:flush()
+    saw_close2 = true
+end)
+
+print("LISTENING2")
+io.stdout:flush()
+
+if not pump_until(function()
+    return opened2
+end, 2000) then
+    io.stderr:write("timeout waiting for OPEN2\n")
+    os.exit(1)
+end
+
 s2:close()
+if not saw_close2 then
+    io.stderr:write("explicit close did not deliver on_close\n")
+    os.exit(1)
+end
+print("JOINED")
+io.stdout:flush()

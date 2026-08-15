@@ -33,6 +33,7 @@ static void set_callback(lua_State *L, const char *name) {
     lua_getiuservalue(L, 1, 1);
     lua_pushvalue(L, 2);
     lua_setfield(L, -2, name);
+    lua_pop(L, 1);
 }
 
 static int sock_on_open(lua_State *L) {
@@ -137,6 +138,7 @@ static int sock_close(lua_State *L) {
     if (!s) {
         return 0;
     }
+    /* stop joins the poll thread; leftover CLOSE is drained below, not via pump. */
     as_socket_stop(s);
     evs = as_socket_take_events(s, &n);
     lua_getiuservalue(L, 1, 1);

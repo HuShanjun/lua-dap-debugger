@@ -596,17 +596,25 @@ void as_socket_stop(as_socket *s) {
     if (!s || s->stopped) {
         return;
     }
+    /* Stop flag + wakeup so WSAPoll/poll cannot sit until the 100ms timeout. */
     s->running = 0;
     as_socket_wakeup(s);
     join_thread(s);
     s->stopped = 1;
 
     as_mutex_lock(&s->lock);
+    /*
+     * Explicit close: if a client was still up, emit CLOSE once so Lua
+     * on_close runs. sock_close() drains leftover events synchronously
+     * after this returns (g_impl is then cleared).
+     */
     if (s->client_fd != AS_INVALID_FD && !s->close_emitted) {
         emit_close_unlocked(s);
     } else {
         close_fd_slot(&s->client_fd);
     }
+    s->send_len = 0;
+    s->send_off = 0;
     close_fd_slot(&s->listen_fd);
     close_fd_slot(&s->wakeup_rd);
     close_fd_slot(&s->wakeup_wr);
@@ -630,7 +638,8 @@ void as_socket_destroy(as_socket *s) {
 
 int as_socket_send(as_socket *s, const void *data, size_t len) {
     const char *p = (const char *)data;
-    int immediate_left;
+    int need_pollout = 0;
+    int fatal = 0;
 
     if (!s || s->stopped || !data) {
         return -1;
@@ -640,29 +649,30 @@ int as_socket_send(as_socket *s, const void *data, size_t len) {
         as_mutex_unlock(&s->lock);
         return -1;
     }
-    immediate_left = 0;
+    /* Nonblocking write; remainder goes to send_buf and POLLOUT flush. */
     if (s->send_off >= s->send_len && len > 0) {
         int n = send(s->client_fd, p, (int)len, 0);
         if (n > 0) {
             p += n;
             len -= (size_t)n;
         } else if (n < 0 && !AS_WOULDBLOCK()) {
-            as_mutex_unlock(&s->lock);
-            return -1;
+            emit_close_unlocked(s);
+            fatal = 1;
         }
     }
-    if (len > 0) {
+    if (!fatal && len > 0) {
         if (send_buf_append(s, p, len) != 0) {
             as_mutex_unlock(&s->lock);
             return -1;
         }
-        immediate_left = 1;
+        need_pollout = 1;
     }
     as_mutex_unlock(&s->lock);
-    if (immediate_left) {
+    if (need_pollout || fatal) {
+        /* Wake poll so it rebuilds the fd set with POLLOUT, or notices CLOSE. */
         as_socket_wakeup(s);
     }
-    return 0;
+    return fatal ? -1 : 0;
 }
 
 as_event *as_socket_take_events(as_socket *s, size_t *out_n) {

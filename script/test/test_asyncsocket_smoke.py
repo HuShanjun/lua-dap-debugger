@@ -1,4 +1,4 @@
-"""asyncsocket listen/pump smoke: OPEN + MSG hello + CLOSE."""
+"""asyncsocket listen/pump smoke: fragments, send echo, close+join, relisten."""
 import socket
 import subprocess
 import sys
@@ -38,6 +38,18 @@ def read_until(proc, token, timeout):
     )
 
 
+def recv_exact(sock, n, timeout):
+    sock.settimeout(timeout)
+    data = b""
+    deadline = time.time() + timeout
+    while len(data) < n and time.time() < deadline:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
 def main():
     lua = find_lua()
     proc = subprocess.Popen(
@@ -52,15 +64,35 @@ def main():
         prefix = read_until(proc, "LISTENING", timeout=5.0)
         time.sleep(0.05)
         c = socket.create_connection(("127.0.0.1", PORT), timeout=3.0)
-        c.sendall(b"hello")
+        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Fragmented TCP writes: Lua must concatenate to "hello".
+        c.sendall(b"hel")
+        time.sleep(0.05)
+        c.sendall(b"lo")
+        echo = recv_exact(c, 5, timeout=3.0)
+        assert echo == b"hello", "echo %r" % (echo,)
         c.shutdown(socket.SHUT_WR)
         c.close()
+
+        mid = read_until(proc, "LISTENING2", timeout=8.0)
+        time.sleep(0.05)
+        c2 = socket.create_connection(("127.0.0.1", PORT), timeout=3.0)
+        c2.settimeout(3.0)
+        try:
+            c2.recv(16)
+        except OSError:
+            pass
+        c2.close()
+
         rest, _ = proc.communicate(timeout=8)
-        out = prefix + (rest or "")
+        out = prefix + mid + (rest or "")
         assert "OPEN" in out, out
-        assert "MSG" in out and "hello" in out, out
+        assert "CONCAT hello" in out, out
         assert "CLOSE" in out, out
         assert "RELISTEN" in out, out
+        assert "OPEN2" in out, out
+        assert "CLOSE2" in out, out
+        assert "JOINED" in out, out
         print("asyncsocket smoke ok")
     finally:
         try:
