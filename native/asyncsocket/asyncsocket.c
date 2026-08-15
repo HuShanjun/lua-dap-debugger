@@ -74,17 +74,17 @@ static as_conn_ud *check_conn(lua_State *L, int idx) {
 
 static void set_callback(lua_State *L, int ud_idx, const char *name) {
     luaL_checktype(L, 2, LUA_TFUNCTION);
-    lua_getiuservalue(L, ud_idx, 1);
+    lua_getuservalue(L, ud_idx);
     lua_pushvalue(L, 2);
     lua_setfield(L, -2, name);
     lua_pop(L, 1);
 }
 
 static void push_conn(lua_State *L, int conn_id) {
-    as_conn_ud *ud = (as_conn_ud *)lua_newuserdatauv(L, sizeof(as_conn_ud), 1);
+    as_conn_ud *ud = (as_conn_ud *)lua_newuserdata(L, sizeof(as_conn_ud));
     ud->conn_id = conn_id;
     lua_newtable(L);
-    lua_setiuservalue(L, -2, 1);
+    lua_setuservalue(L, -2);
     luaL_setmetatable(L, AS_CONN_MT);
 
     registry_get_conns(L);
@@ -175,7 +175,7 @@ static int dispatch_accept(lua_State *L, int conn_id) {
         lua_pop(L, 2);
         return 0;
     }
-    lua_getiuservalue(L, -1, 1);
+    lua_getuservalue(L, -1);
     lua_getfield(L, -1, "on_accept");
     lua_remove(L, -2); /* uv */
     lua_remove(L, -2); /* server */
@@ -202,7 +202,7 @@ static int fire_conn_cb(lua_State *L, int conn_id, const char *name, int with_pa
         lua_pop(L, 1);
         return 0;
     }
-    lua_getiuservalue(L, -1, 1);
+    lua_getuservalue(L, -1);
     lua_getfield(L, -1, name);
     lua_remove(L, -2);
     if (!lua_isfunction(L, -1)) {
@@ -254,10 +254,10 @@ static int l_listen(lua_State *L) {
         return luaL_error(L, "asyncsocket.listen failed: %s", err[0] ? err : "unknown");
     }
 
-    ud = (as_server_ud *)lua_newuserdatauv(L, sizeof(as_server_ud), 1);
+    ud = (as_server_ud *)lua_newuserdata(L, sizeof(as_server_ud));
     ud->alive = 1;
     lua_newtable(L);
-    lua_setiuservalue(L, -2, 1);
+    lua_setuservalue(L, -2);
     luaL_setmetatable(L, AS_SERVER_MT);
     set_current_server(L, -1);
     return 1;
