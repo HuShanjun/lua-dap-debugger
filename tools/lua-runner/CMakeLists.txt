@@ -4,7 +4,8 @@ add_executable(lua-runner lua_runner.c)
 target_include_directories(lua-runner PRIVATE
   ${LUA_INCLUDE_DIR}
   ${CMAKE_SOURCE_DIR}/native/luadap
-  ${CMAKE_SOURCE_DIR}/native/common)
+  ${CMAKE_SOURCE_DIR}/native/common
+  ${CMAKE_SOURCE_DIR}/3rd/cJSON)
 target_link_libraries(lua-runner PRIVATE luadap_static liblua)
 # WIN32: ws2_32 already via luadap_static transitive or add explicitly
 if(WIN32)

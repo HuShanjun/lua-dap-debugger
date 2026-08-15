@@ -7,7 +7,6 @@ from dap_client import DapClient
 
 ROOT = Path(__file__).resolve().parents[2]
 PORT = 18290
-RUNNER = ROOT / "bin" / "lua-runner.exe"  # also try bin/Debug/
 DEBUGEE = ROOT / "script" / "test" / "run_debugee_runner.lua"
 
 
@@ -16,6 +15,21 @@ def find_runner():
         if p.exists():
             return str(p)
     raise SystemExit("lua-runner not found; build target lua-runner first")
+
+
+def wait_for_dap_client(host, port, timeout=15.0):
+    """Retry TCP connect until the runner listen socket accepts (CI cold start)."""
+    deadline = time.monotonic() + timeout
+    last_err = None
+    while time.monotonic() < deadline:
+        try:
+            client = DapClient(host, port, timeout=0.2)
+            client.sock.settimeout(3.0)
+            return client
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05)
+    raise TimeoutError(f"DAP port {port} never accepted a connection: {last_err}")
 
 
 def main():
@@ -27,9 +41,9 @@ def main():
         stderr=subprocess.STDOUT,
         text=True,
     )
-    time.sleep(0.5)
+    c = None
     try:
-        c = DapClient("127.0.0.1", PORT, timeout=3.0)
+        c = wait_for_dap_client("127.0.0.1", PORT)
         c.send_request(
             "initialize",
             {
@@ -55,11 +69,16 @@ def main():
         c.wait_for(
             lambda m: m.get("type") == "response" and m.get("command") == "configurationDone"
         )
+        c.close()
+        c = None
         try:
             out, _ = proc.communicate(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
             out, _ = proc.communicate()
+            raise AssertionError(
+                "runner did not exit after DAP client disconnect:\n" + (out or "")
+            )
         assert "DEBUGEE_DONE" in out, out
         print("runner handshake ok")
     finally:
@@ -67,10 +86,11 @@ def main():
             proc.kill()
         except Exception:
             pass
-        try:
-            c.close()
-        except Exception:
-            pass
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

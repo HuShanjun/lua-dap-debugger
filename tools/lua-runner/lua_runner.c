@@ -12,6 +12,7 @@
 #endif
 
 #include "lua_compat.h"
+#include "dap_session.h"
 
 extern int luaopen_luadap(lua_State *L);
 
@@ -158,6 +159,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%s\n", lua_tostring(L, -1));
             break;
         }
+        /* Hosts keep listening after soft-reset; this CLI exits when VS Code
+         * disconnects (start already completed, client gone). */
+        if (!dap_session_client_open())
+            break;
         runner_sleep();
     }
 
