@@ -1,5 +1,5 @@
 /*
- * Poll thread: WSAPoll/poll, accept/recv, enqueue events, flush send buf.
+ * Multi-connection poll engine: listen/accept, outbound connect, send/recv.
  * This file must not call any Lua API.
  */
 #ifdef _WIN32
@@ -35,6 +35,8 @@ typedef WSAPOLLFD as_pollfd;
 #define as_mutex_unlock(m) LeaveCriticalSection(m)
 #define as_mutex_destroy(m) DeleteCriticalSection(m)
 #define AS_WOULDBLOCK() (WSAGetLastError() == WSAEWOULDBLOCK)
+#define AS_INPROGRESS() \
+    (WSAGetLastError() == WSAEWOULDBLOCK || WSAGetLastError() == WSAEINPROGRESS)
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -60,6 +62,7 @@ typedef struct pollfd as_pollfd;
 #define as_mutex_unlock(m) pthread_mutex_unlock(m)
 #define as_mutex_destroy(m) pthread_mutex_destroy(m)
 #define AS_WOULDBLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
+#define AS_INPROGRESS() (errno == EINPROGRESS || errno == EWOULDBLOCK)
 #endif
 
 #ifndef POLLIN
@@ -82,21 +85,43 @@ typedef struct pollfd as_pollfd;
         } \
     } while (0)
 
-struct as_socket {
-    as_fd listen_fd;
-    as_fd client_fd;
-    as_fd wakeup_rd;
-    as_fd wakeup_wr;
+#define AS_KIND_INBOUND 0
+#define AS_KIND_OUTBOUND 1
+#define AS_KIND_CONNECTING 2
 
-    as_mutex lock;
-    as_event *q;
-    size_t q_count;
-    size_t q_cap;
-
+typedef struct as_conn {
+    int id;
+    as_fd fd;
+    int kind;
+    int closing;
+    int close_emitted;
+    int poll_idx;
     char *send_buf;
     size_t send_len;
     size_t send_off;
     size_t send_cap;
+} as_conn;
+
+typedef struct as_engine {
+    as_mutex lock;
+    int inited;
+
+    as_fd listen_fd;
+    as_fd wakeup_rd;
+    as_fd wakeup_wr;
+    int listen_close_requested;
+
+    as_conn *conns;
+    size_t conn_count;
+    size_t conn_cap;
+    int next_id;
+
+    as_event *q;
+    size_t q_count;
+    size_t q_cap;
+
+    as_pollfd *pfds;
+    int pfds_cap;
 
 #ifdef _WIN32
     HANDLE thread;
@@ -104,11 +129,10 @@ struct as_socket {
     pthread_t thread;
 #endif
     volatile int running;
-    int stopped;
-    int close_emitted;
-    int close_requested; /* Lua/send thread: close fd on poll thread only */
     int thread_started;
-};
+} as_engine;
+
+static as_engine g_eng;
 
 int as_net_init(void) {
 #ifdef _WIN32
@@ -123,6 +147,19 @@ int as_net_init(void) {
     done = 1;
 #endif
     return 0;
+}
+
+static void engine_init_once(void) {
+    if (g_eng.inited) {
+        return;
+    }
+    memset(&g_eng, 0, sizeof(g_eng));
+    g_eng.listen_fd = AS_INVALID_FD;
+    g_eng.wakeup_rd = AS_INVALID_FD;
+    g_eng.wakeup_wr = AS_INVALID_FD;
+    g_eng.next_id = 1;
+    as_mutex_init(&g_eng.lock);
+    g_eng.inited = 1;
 }
 
 static int set_nonblock(as_fd fd) {
@@ -150,22 +187,31 @@ static void close_fd_slot(as_fd *fd) {
     }
 }
 
-static int enqueue_unlocked(as_socket *s, as_event_type type, const char *p, size_t n) {
+static void engine_wakeup(void) {
+    char b = 1;
+    if (g_eng.wakeup_wr == AS_INVALID_FD) {
+        return;
+    }
+    send(g_eng.wakeup_wr, &b, 1, 0);
+}
+
+static int enqueue_unlocked(as_event_type type, int conn_id, const char *p, size_t n) {
     as_event *ni;
     as_event *e;
     size_t cap;
 
-    if (s->q_count == s->q_cap) {
-        cap = s->q_cap ? s->q_cap * 2 : 8;
-        ni = (as_event *)realloc(s->q, cap * sizeof(as_event));
+    if (g_eng.q_count == g_eng.q_cap) {
+        cap = g_eng.q_cap ? g_eng.q_cap * 2 : 8;
+        ni = (as_event *)realloc(g_eng.q, cap * sizeof(as_event));
         if (!ni) {
             return -1;
         }
-        s->q = ni;
-        s->q_cap = cap;
+        g_eng.q = ni;
+        g_eng.q_cap = cap;
     }
-    e = &s->q[s->q_count];
+    e = &g_eng.q[g_eng.q_count];
     e->type = type;
+    e->conn_id = conn_id;
     e->payload = NULL;
     e->len = 0;
     if (p && n > 0) {
@@ -176,195 +222,351 @@ static int enqueue_unlocked(as_socket *s, as_event_type type, const char *p, siz
         memcpy(e->payload, p, n);
         e->len = n;
     }
-    s->q_count++;
+    g_eng.q_count++;
     return 0;
 }
 
-static void emit_close_unlocked(as_socket *s) {
+static int alloc_conn_id_unlocked(void) {
+    int id = g_eng.next_id;
+    if (id <= 0) {
+        id = 1;
+    }
+    g_eng.next_id = id + 1;
+    if (g_eng.next_id <= 0) {
+        g_eng.next_id = 1;
+    }
+    return id;
+}
+
+static as_conn *alloc_conn_unlocked(as_fd fd, int kind) {
+    as_conn *c;
+    size_t cap;
+    as_conn *ni;
+
+    if (g_eng.conn_count == g_eng.conn_cap) {
+        cap = g_eng.conn_cap ? g_eng.conn_cap * 2 : 8;
+        ni = (as_conn *)realloc(g_eng.conns, cap * sizeof(as_conn));
+        if (!ni) {
+            return NULL;
+        }
+        g_eng.conns = ni;
+        g_eng.conn_cap = cap;
+    }
+    c = &g_eng.conns[g_eng.conn_count++];
+    memset(c, 0, sizeof(*c));
+    c->id = alloc_conn_id_unlocked();
+    c->fd = fd;
+    c->kind = kind;
+    c->poll_idx = -1;
+    return c;
+}
+
+static as_conn *conn_by_id_unlocked(int id) {
+    size_t i;
+    if (id <= 0) {
+        return NULL;
+    }
+    for (i = 0; i < g_eng.conn_count; i++) {
+        if (g_eng.conns[i].id == id) {
+            return &g_eng.conns[i];
+        }
+    }
+    return NULL;
+}
+
+static void conn_free_send(as_conn *c) {
+    free(c->send_buf);
+    c->send_buf = NULL;
+    c->send_len = 0;
+    c->send_off = 0;
+    c->send_cap = 0;
+}
+
+static void conn_remove_at_unlocked(size_t i) {
+    as_conn *c;
+    if (i >= g_eng.conn_count) {
+        return;
+    }
+    c = &g_eng.conns[i];
+    if (c->fd != AS_INVALID_FD) {
+        as_close_fd(c->fd);
+        c->fd = AS_INVALID_FD;
+    }
+    conn_free_send(c);
+    if (i + 1 < g_eng.conn_count) {
+        g_eng.conns[i] = g_eng.conns[g_eng.conn_count - 1];
+    }
+    memset(&g_eng.conns[g_eng.conn_count - 1], 0, sizeof(as_conn));
+    g_eng.conn_count--;
+}
+
+static void emit_close_unlocked(as_conn *c) {
     /* Poll thread or post-join only: never closesocket while WSAPoll holds fd. */
-    if (s->client_fd != AS_INVALID_FD) {
-        as_close_fd(s->client_fd);
-        s->client_fd = AS_INVALID_FD;
+    if (c->fd != AS_INVALID_FD) {
+        as_close_fd(c->fd);
+        c->fd = AS_INVALID_FD;
     }
-    s->close_requested = 0;
-    s->send_len = 0;
-    s->send_off = 0;
-    if (!s->close_emitted) {
-        s->close_emitted = 1;
-        enqueue_unlocked(s, AS_EVT_CLOSE, NULL, 0);
-    }
-}
-
-/* Lua/send thread: enqueue CLOSE and wake poll; do not closesocket here. */
-static void request_close_unlocked(as_socket *s) {
-    s->close_requested = 1;
-    s->send_len = 0;
-    s->send_off = 0;
-    if (!s->close_emitted) {
-        s->close_emitted = 1;
-        enqueue_unlocked(s, AS_EVT_CLOSE, NULL, 0);
+    c->closing = 0;
+    conn_free_send(c);
+    if (!c->close_emitted) {
+        c->close_emitted = 1;
+        enqueue_unlocked(AS_EVT_CLOSE, c->id, NULL, 0);
     }
 }
 
-static void apply_requested_close_unlocked(as_socket *s) {
-    if (s->close_requested) {
-        emit_close_unlocked(s);
+static void request_close_unlocked(as_conn *c) {
+    c->closing = 1;
+    conn_free_send(c);
+    if (!c->close_emitted) {
+        c->close_emitted = 1;
+        enqueue_unlocked(AS_EVT_CLOSE, c->id, NULL, 0);
     }
 }
 
-static int send_buf_append(as_socket *s, const char *p, size_t n) {
+static int send_buf_append(as_conn *c, const char *p, size_t n) {
     size_t need;
     size_t cap;
     char *nb;
 
-    if (s->send_off > 0) {
-        if (s->send_len > s->send_off) {
-            memmove(s->send_buf, s->send_buf + s->send_off, s->send_len - s->send_off);
-            s->send_len -= s->send_off;
+    if (c->send_off > 0) {
+        if (c->send_len > c->send_off) {
+            memmove(c->send_buf, c->send_buf + c->send_off, c->send_len - c->send_off);
+            c->send_len -= c->send_off;
         } else {
-            s->send_len = 0;
+            c->send_len = 0;
         }
-        s->send_off = 0;
+        c->send_off = 0;
     }
-    need = s->send_len + n;
-    if (need > s->send_cap) {
-        cap = s->send_cap ? s->send_cap * 2 : 256;
+    need = c->send_len + n;
+    if (need > c->send_cap) {
+        cap = c->send_cap ? c->send_cap * 2 : 256;
         while (cap < need) {
             cap *= 2;
         }
-        nb = (char *)realloc(s->send_buf, cap);
+        nb = (char *)realloc(c->send_buf, cap);
         if (!nb) {
             return -1;
         }
-        s->send_buf = nb;
-        s->send_cap = cap;
+        c->send_buf = nb;
+        c->send_cap = cap;
     }
-    memcpy(s->send_buf + s->send_len, p, n);
-    s->send_len += n;
+    memcpy(c->send_buf + c->send_len, p, n);
+    c->send_len += n;
     return 0;
 }
 
-static void flush_send_unlocked(as_socket *s) {
-    while (s->client_fd != AS_INVALID_FD && s->send_off < s->send_len) {
+static void flush_send_unlocked(as_conn *c) {
+    while (c->fd != AS_INVALID_FD && c->send_off < c->send_len) {
         int n = send(
-            s->client_fd,
-            s->send_buf + s->send_off,
-            (int)(s->send_len - s->send_off),
+            c->fd,
+            c->send_buf + c->send_off,
+            (int)(c->send_len - c->send_off),
             0);
         if (n > 0) {
-            s->send_off += (size_t)n;
-            if (s->send_off >= s->send_len) {
-                s->send_len = 0;
-                s->send_off = 0;
+            c->send_off += (size_t)n;
+            if (c->send_off >= c->send_len) {
+                c->send_len = 0;
+                c->send_off = 0;
             }
             continue;
         }
         if (n < 0 && AS_WOULDBLOCK()) {
             break;
         }
-        emit_close_unlocked(s);
+        emit_close_unlocked(c);
         break;
     }
 }
 
-static void drain_wakeup(as_socket *s) {
+static void drain_wakeup(void) {
     char buf[64];
-    while (s->wakeup_rd != AS_INVALID_FD) {
-        int n = recv(s->wakeup_rd, buf, (int)sizeof(buf), 0);
+    while (g_eng.wakeup_rd != AS_INVALID_FD) {
+        int n = recv(g_eng.wakeup_rd, buf, (int)sizeof(buf), 0);
         if (n <= 0) {
             break;
         }
     }
 }
 
-static void handle_accept(as_socket *s) {
-    as_fd c = accept(s->listen_fd, NULL, NULL);
-    if (c == AS_INVALID_FD) {
-        return;
+static void apply_listen_close_unlocked(void) {
+    if (g_eng.listen_close_requested) {
+        close_fd_slot(&g_eng.listen_fd);
+        g_eng.listen_close_requested = 0;
     }
-    if (set_nonblock(c) != 0) {
-        as_close_fd(c);
-        return;
-    }
-    set_nodelay(c);
-    /*
-     * V1: one listen + at most one client.
-     * Choice: reject the new connection (close it) and keep the existing client.
-     */
-    if (s->client_fd != AS_INVALID_FD) {
-        as_close_fd(c);
-        return;
-    }
-    s->client_fd = c;
-    s->close_emitted = 0;
-    s->close_requested = 0;
-    enqueue_unlocked(s, AS_EVT_OPEN, NULL, 0);
 }
 
-static void handle_client_read(as_socket *s) {
+static void handle_accept(void) {
+    as_fd cfd;
+    as_conn *c;
+
+    if (g_eng.listen_fd == AS_INVALID_FD) {
+        return;
+    }
+    cfd = accept(g_eng.listen_fd, NULL, NULL);
+    if (cfd == AS_INVALID_FD) {
+        return;
+    }
+    if (set_nonblock(cfd) != 0) {
+        as_close_fd(cfd);
+        return;
+    }
+    set_nodelay(cfd);
+    c = alloc_conn_unlocked(cfd, AS_KIND_INBOUND);
+    if (!c) {
+        as_close_fd(cfd);
+        return;
+    }
+    enqueue_unlocked(AS_EVT_ACCEPT, c->id, NULL, 0);
+}
+
+static void handle_conn_read(as_conn *c) {
     char buf[4096];
     for (;;) {
         int n;
-        if (s->client_fd == AS_INVALID_FD) {
+        if (c->fd == AS_INVALID_FD) {
             return;
         }
-        n = recv(s->client_fd, buf, (int)sizeof(buf), 0);
+        n = recv(c->fd, buf, (int)sizeof(buf), 0);
         if (n > 0) {
-            enqueue_unlocked(s, AS_EVT_MESSAGE, buf, (size_t)n);
+            enqueue_unlocked(AS_EVT_MESSAGE, c->id, buf, (size_t)n);
             continue;
         }
         if (n < 0 && AS_WOULDBLOCK()) {
             return;
         }
-        /* recv==0, fatal error, or hangup: peer closed / dead connection */
-        emit_close_unlocked(s);
+        emit_close_unlocked(c);
         return;
     }
 }
 
-static void poll_loop(as_socket *s) {
-    while (s->running) {
-        as_pollfd fds[3];
+static int sock_error(as_fd fd) {
+    int soerr = 0;
+#ifdef _WIN32
+    int slen = (int)sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &slen) != 0) {
+        return WSAGetLastError();
+    }
+#else
+    socklen_t slen = (socklen_t)sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0) {
+        return errno;
+    }
+#endif
+    return soerr;
+}
+
+static void handle_connect_complete(as_conn *c, short rev) {
+    int soerr;
+
+    if (c->fd == AS_INVALID_FD) {
+        return;
+    }
+    if (rev & (POLLERR | POLLHUP)) {
+        emit_close_unlocked(c);
+        return;
+    }
+    if (!(rev & POLLOUT)) {
+        return;
+    }
+    soerr = sock_error(c->fd);
+    if (soerr != 0) {
+        emit_close_unlocked(c);
+        return;
+    }
+    set_nodelay(c->fd);
+    c->kind = AS_KIND_OUTBOUND;
+    enqueue_unlocked(AS_EVT_OPEN, c->id, NULL, 0);
+}
+
+static int pfds_ensure(int needed) {
+    as_pollfd *ni;
+    int cap;
+
+    if (needed <= g_eng.pfds_cap) {
+        return 0;
+    }
+    cap = g_eng.pfds_cap ? g_eng.pfds_cap * 2 : 8;
+    while (cap < needed) {
+        cap *= 2;
+    }
+    ni = (as_pollfd *)realloc(g_eng.pfds, (size_t)cap * sizeof(as_pollfd));
+    if (!ni) {
+        return -1;
+    }
+    g_eng.pfds = ni;
+    g_eng.pfds_cap = cap;
+    return 0;
+}
+
+static void poll_loop(void) {
+    while (g_eng.running) {
+        as_pollfd *fds;
         int nfds = 0;
         int i_listen = -1;
-        int i_client = -1;
         int i_wake = -1;
         int pr;
+        size_t i;
 
-        as_mutex_lock(&s->lock);
-        apply_requested_close_unlocked(s);
-        if (s->listen_fd != AS_INVALID_FD) {
+        as_mutex_lock(&g_eng.lock);
+        apply_listen_close_unlocked();
+        for (i = 0; i < g_eng.conn_count;) {
+            as_conn *c = &g_eng.conns[i];
+            if (c->closing) {
+                emit_close_unlocked(c);
+                conn_remove_at_unlocked(i);
+                continue;
+            }
+            i++;
+        }
+
+        if (pfds_ensure((int)g_eng.conn_count + 2) != 0) {
+            as_mutex_unlock(&g_eng.lock);
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(1000);
+#endif
+            continue;
+        }
+        fds = g_eng.pfds;
+
+        if (g_eng.listen_fd != AS_INVALID_FD) {
             i_listen = nfds;
-            fds[nfds].fd = s->listen_fd;
+            fds[nfds].fd = g_eng.listen_fd;
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
             nfds++;
         }
-        if (s->client_fd != AS_INVALID_FD) {
-            i_client = nfds;
-            fds[nfds].fd = s->client_fd;
-            fds[nfds].events = POLLIN;
-            if (s->send_off < s->send_len) {
-                fds[nfds].events = (short)(fds[nfds].events | POLLOUT);
+        for (i = 0; i < g_eng.conn_count; i++) {
+            as_conn *c = &g_eng.conns[i];
+            c->poll_idx = nfds;
+            fds[nfds].fd = c->fd;
+            if (c->kind == AS_KIND_CONNECTING) {
+                fds[nfds].events = POLLOUT;
+            } else {
+                fds[nfds].events = POLLIN;
+                if (c->send_off < c->send_len) {
+                    fds[nfds].events = (short)(fds[nfds].events | POLLOUT);
+                }
             }
             fds[nfds].revents = 0;
             nfds++;
         }
-        if (s->wakeup_rd != AS_INVALID_FD) {
+        if (g_eng.wakeup_rd != AS_INVALID_FD) {
             i_wake = nfds;
-            fds[nfds].fd = s->wakeup_rd;
+            fds[nfds].fd = g_eng.wakeup_rd;
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
             nfds++;
         }
-        as_mutex_unlock(&s->lock);
+        as_mutex_unlock(&g_eng.lock);
 
         if (nfds == 0) {
             break;
         }
 
         pr = as_poll(fds, (unsigned long)nfds, 100);
-        if (!s->running) {
+        if (!g_eng.running) {
             break;
         }
         if (pr < 0) {
@@ -380,35 +582,65 @@ static void poll_loop(as_socket *s) {
             continue;
         }
 
-        as_mutex_lock(&s->lock);
-        apply_requested_close_unlocked(s);
+        as_mutex_lock(&g_eng.lock);
+        apply_listen_close_unlocked();
         if (i_wake >= 0 && (fds[i_wake].revents & POLLIN)) {
-            drain_wakeup(s);
+            drain_wakeup();
         }
-        if (i_listen >= 0 && (fds[i_listen].revents & POLLIN)) {
-            handle_accept(s);
+        if (i_listen >= 0 && g_eng.listen_fd != AS_INVALID_FD &&
+            (fds[i_listen].revents & POLLIN)) {
+            handle_accept();
         }
-        if (i_client >= 0 && s->client_fd != AS_INVALID_FD) {
-            short rev = fds[i_client].revents;
+        for (i = 0; i < g_eng.conn_count;) {
+            as_conn *c = &g_eng.conns[i];
+            short rev = 0;
+            int pidx = c->poll_idx;
+
+            if (c->closing) {
+                emit_close_unlocked(c);
+                conn_remove_at_unlocked(i);
+                continue;
+            }
+            if (pidx >= 0 && pidx < nfds) {
+                rev = fds[pidx].revents;
+            }
+            if (c->kind == AS_KIND_CONNECTING) {
+                if (rev & (POLLOUT | POLLERR | POLLHUP)) {
+                    handle_connect_complete(c, rev);
+                }
+                if (c->fd == AS_INVALID_FD) {
+                    conn_remove_at_unlocked(i);
+                    continue;
+                }
+                i++;
+                continue;
+            }
             if (rev & (POLLIN | POLLHUP | POLLERR)) {
-                handle_client_read(s);
+                handle_conn_read(c);
             }
-            if (s->client_fd != AS_INVALID_FD && (rev & POLLOUT)) {
-                flush_send_unlocked(s);
+            if (c->fd != AS_INVALID_FD && (rev & POLLOUT)) {
+                flush_send_unlocked(c);
             }
+            if (c->fd == AS_INVALID_FD) {
+                conn_remove_at_unlocked(i);
+                continue;
+            }
+            i++;
         }
-        as_mutex_unlock(&s->lock);
+        as_mutex_unlock(&g_eng.lock);
     }
 }
 
 #ifdef _WIN32
 static unsigned __stdcall poll_thread_main(void *arg) {
-    poll_loop((as_socket *)arg);
+    (void)arg;
+    poll_loop();
     return 0;
 }
 #else
 static void *poll_thread_main(void *arg) {
-    poll_loop((as_socket *)arg);
+    (void)arg;
+    poll_loop();
     return NULL;
 }
 #endif
@@ -513,7 +745,7 @@ static as_fd create_listen_fd(const char *host, int port, char *err, size_t errl
             fd = AS_INVALID_FD;
             continue;
         }
-        if (listen(fd, 1) != 0) {
+        if (listen(fd, SOMAXCONN) != 0) {
             as_close_fd(fd);
             fd = AS_INVALID_FD;
             continue;
@@ -532,189 +764,326 @@ static as_fd create_listen_fd(const char *host, int port, char *err, size_t errl
     return fd;
 }
 
-static as_socket *as_socket_new(void) {
-    as_socket *s = (as_socket *)calloc(1, sizeof(as_socket));
-    if (!s) {
-        return NULL;
+static int begin_connect_fd(
+    const char *host,
+    int port,
+    as_fd *out_fd,
+    int *out_immediate,
+    char *err,
+    size_t errlen) {
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *it;
+    char portstr[16];
+    int rc;
+    const char *node = host;
+
+    *out_fd = AS_INVALID_FD;
+    *out_immediate = 0;
+    if (!node || !node[0]) {
+        AS_SETERR(err, errlen, "invalid host");
+        return -1;
     }
-    s->listen_fd = AS_INVALID_FD;
-    s->client_fd = AS_INVALID_FD;
-    s->wakeup_rd = AS_INVALID_FD;
-    s->wakeup_wr = AS_INVALID_FD;
-    as_mutex_init(&s->lock);
-    return s;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    rc = getaddrinfo(node, portstr, &hints, &res);
+    if (rc != 0) {
+#ifdef _WIN32
+        AS_SETERR(err, errlen, "getaddrinfo failed (%d)", WSAGetLastError());
+#else
+        AS_SETERR(err, errlen, "getaddrinfo failed: %s", gai_strerror(rc));
+#endif
+        return -1;
+    }
+    for (it = res; it; it = it->ai_next) {
+        as_fd fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd == AS_INVALID_FD) {
+            continue;
+        }
+        if (set_nonblock(fd) != 0) {
+            as_close_fd(fd);
+            continue;
+        }
+        rc = connect(fd, it->ai_addr, (int)it->ai_addrlen);
+        if (rc == 0) {
+            set_nodelay(fd);
+            *out_fd = fd;
+            *out_immediate = 1;
+            freeaddrinfo(res);
+            return 0;
+        }
+        if (AS_INPROGRESS()) {
+            *out_fd = fd;
+            *out_immediate = 0;
+            freeaddrinfo(res);
+            return 0;
+        }
+        as_close_fd(fd);
+    }
+    freeaddrinfo(res);
+    AS_SETERR(err, errlen, "connect failed to %s:%d", host, port);
+    return -1;
 }
 
-as_socket *as_socket_listen(const char *host, int port, char *err, size_t errlen) {
-    as_socket *s;
+static int engine_ensure_running(char *err, size_t errlen) {
+    if (g_eng.thread_started) {
+        return 0;
+    }
+    if (create_wakeup_pair(&g_eng.wakeup_rd, &g_eng.wakeup_wr, err, errlen) != 0) {
+        return -1;
+    }
+    g_eng.running = 1;
+#ifdef _WIN32
+    g_eng.thread = (HANDLE)_beginthreadex(NULL, 0, poll_thread_main, NULL, 0, NULL);
+    if (!g_eng.thread) {
+        AS_SETERR(err, errlen, "failed to start poll thread");
+        g_eng.running = 0;
+        close_fd_slot(&g_eng.wakeup_rd);
+        close_fd_slot(&g_eng.wakeup_wr);
+        return -1;
+    }
+#else
+    if (pthread_create(&g_eng.thread, NULL, poll_thread_main, NULL) != 0) {
+        AS_SETERR(err, errlen, "failed to start poll thread");
+        g_eng.running = 0;
+        close_fd_slot(&g_eng.wakeup_rd);
+        close_fd_slot(&g_eng.wakeup_wr);
+        return -1;
+    }
+#endif
+    g_eng.thread_started = 1;
+    return 0;
+}
+
+static void join_thread(void) {
+    if (!g_eng.thread_started) {
+        return;
+    }
+#ifdef _WIN32
+    if (g_eng.thread) {
+        WaitForSingleObject(g_eng.thread, INFINITE);
+        CloseHandle(g_eng.thread);
+        g_eng.thread = NULL;
+    }
+#else
+    pthread_join(g_eng.thread, NULL);
+#endif
+    g_eng.thread_started = 0;
+}
+
+static void sleep_1ms(void) {
+#ifdef _WIN32
+    Sleep(1);
+#else
+    usleep(1000);
+#endif
+}
+
+int as_listen(const char *host, int port, char *err, size_t errlen) {
+    as_fd fd;
+    int tries;
 
     if (as_net_init() != 0) {
         AS_SETERR(err, errlen, "WSAStartup failed");
-        return NULL;
+        return -1;
     }
+    engine_init_once();
     if (!host || port <= 0 || port > 65535) {
         AS_SETERR(err, errlen, "invalid host/port");
-        return NULL;
+        return -1;
     }
-    s = as_socket_new();
-    if (!s) {
+
+    for (tries = 0; tries < 1000; tries++) {
+        as_mutex_lock(&g_eng.lock);
+        if (g_eng.listen_close_requested) {
+            as_mutex_unlock(&g_eng.lock);
+            engine_wakeup();
+            sleep_1ms();
+            continue;
+        }
+        if (g_eng.listen_fd != AS_INVALID_FD) {
+            as_mutex_unlock(&g_eng.lock);
+            AS_SETERR(err, errlen, "listen already active");
+            return -1;
+        }
+        as_mutex_unlock(&g_eng.lock);
+        break;
+    }
+
+    fd = create_listen_fd(host, port, err, errlen);
+    if (fd == AS_INVALID_FD) {
+        return -1;
+    }
+
+    as_mutex_lock(&g_eng.lock);
+    if (g_eng.listen_fd != AS_INVALID_FD || g_eng.listen_close_requested) {
+        as_mutex_unlock(&g_eng.lock);
+        as_close_fd(fd);
+        AS_SETERR(err, errlen, "listen already active");
+        return -1;
+    }
+    if (engine_ensure_running(err, errlen) != 0) {
+        as_mutex_unlock(&g_eng.lock);
+        as_close_fd(fd);
+        return -1;
+    }
+    g_eng.listen_fd = fd;
+    as_mutex_unlock(&g_eng.lock);
+    engine_wakeup();
+    return 0;
+}
+
+int as_connect(const char *host, int port, char *err, size_t errlen) {
+    as_fd fd;
+    int immediate = 0;
+    as_conn *c;
+    int id;
+
+    if (as_net_init() != 0) {
+        AS_SETERR(err, errlen, "WSAStartup failed");
+        return -1;
+    }
+    engine_init_once();
+    if (!host || port <= 0 || port > 65535) {
+        AS_SETERR(err, errlen, "invalid host/port");
+        return -1;
+    }
+    if (begin_connect_fd(host, port, &fd, &immediate, err, errlen) != 0) {
+        return -1;
+    }
+
+    as_mutex_lock(&g_eng.lock);
+    if (engine_ensure_running(err, errlen) != 0) {
+        as_mutex_unlock(&g_eng.lock);
+        as_close_fd(fd);
+        return -1;
+    }
+    c = alloc_conn_unlocked(fd, immediate ? AS_KIND_OUTBOUND : AS_KIND_CONNECTING);
+    if (!c) {
+        as_mutex_unlock(&g_eng.lock);
+        as_close_fd(fd);
         AS_SETERR(err, errlen, "out of memory");
-        return NULL;
+        return -1;
     }
-    if (create_wakeup_pair(&s->wakeup_rd, &s->wakeup_wr, err, errlen) != 0) {
-        as_socket_destroy(s);
-        return NULL;
+    id = c->id;
+    if (immediate) {
+        enqueue_unlocked(AS_EVT_OPEN, id, NULL, 0);
     }
-    s->listen_fd = create_listen_fd(host, port, err, errlen);
-    if (s->listen_fd == AS_INVALID_FD) {
-        as_socket_destroy(s);
-        return NULL;
-    }
-    s->running = 1;
-#ifdef _WIN32
-    s->thread = (HANDLE)_beginthreadex(NULL, 0, poll_thread_main, s, 0, NULL);
-    if (!s->thread) {
-        AS_SETERR(err, errlen, "failed to start poll thread");
-        s->running = 0;
-        as_socket_destroy(s);
-        return NULL;
-    }
-#else
-    if (pthread_create(&s->thread, NULL, poll_thread_main, s) != 0) {
-        AS_SETERR(err, errlen, "failed to start poll thread");
-        s->running = 0;
-        as_socket_destroy(s);
-        return NULL;
-    }
-#endif
-    s->thread_started = 1;
-    return s;
+    as_mutex_unlock(&g_eng.lock);
+    engine_wakeup();
+    return id;
 }
 
-void as_socket_wakeup(as_socket *s) {
-    char b = 1;
-    if (!s || s->wakeup_wr == AS_INVALID_FD) {
-        return;
-    }
-    send(s->wakeup_wr, &b, 1, 0);
-}
-
-static void join_thread(as_socket *s) {
-    if (!s->thread_started) {
-        return;
-    }
-#ifdef _WIN32
-    if (s->thread) {
-        WaitForSingleObject(s->thread, INFINITE);
-        CloseHandle(s->thread);
-        s->thread = NULL;
-    }
-#else
-    pthread_join(s->thread, NULL);
-#endif
-    s->thread_started = 0;
-}
-
-void as_socket_stop(as_socket *s) {
-    if (!s || s->stopped) {
-        return;
-    }
-    /* Stop flag + wakeup so WSAPoll/poll cannot sit until the 100ms timeout. */
-    s->running = 0;
-    as_socket_wakeup(s);
-    join_thread(s);
-    s->stopped = 1;
-
-    as_mutex_lock(&s->lock);
-    /*
-     * Explicit close: if a client was still up, emit CLOSE once so Lua
-     * on_close runs. sock_close() drains leftover events synchronously
-     * after this returns (g_impl is then cleared).
-     */
-    if (s->client_fd != AS_INVALID_FD && !s->close_emitted) {
-        emit_close_unlocked(s);
-    } else {
-        close_fd_slot(&s->client_fd);
-    }
-    s->send_len = 0;
-    s->send_off = 0;
-    close_fd_slot(&s->listen_fd);
-    close_fd_slot(&s->wakeup_rd);
-    close_fd_slot(&s->wakeup_wr);
-    as_mutex_unlock(&s->lock);
-}
-
-void as_socket_destroy(as_socket *s) {
-    if (!s) {
-        return;
-    }
-    as_socket_stop(s);
-    as_events_free(s->q, s->q_count);
-    s->q = NULL;
-    s->q_count = 0;
-    s->q_cap = 0;
-    free(s->send_buf);
-    s->send_buf = NULL;
-    as_mutex_destroy(&s->lock);
-    free(s);
-}
-
-int as_socket_send(as_socket *s, const void *data, size_t len) {
+int as_conn_send(int conn_id, const void *data, size_t len) {
     const char *p = (const char *)data;
+    as_conn *c;
     int need_pollout = 0;
     int fatal = 0;
 
-    if (!s || s->stopped || !data) {
+    engine_init_once();
+    if (conn_id <= 0 || !data) {
         return -1;
     }
-    as_mutex_lock(&s->lock);
-    if (s->client_fd == AS_INVALID_FD) {
-        as_mutex_unlock(&s->lock);
+    as_mutex_lock(&g_eng.lock);
+    c = conn_by_id_unlocked(conn_id);
+    if (!c || c->fd == AS_INVALID_FD || c->closing || c->kind == AS_KIND_CONNECTING) {
+        as_mutex_unlock(&g_eng.lock);
         return -1;
     }
-    /* Nonblocking write; remainder goes to send_buf and POLLOUT flush. */
-    if (s->send_off >= s->send_len && len > 0) {
-        int n = send(s->client_fd, p, (int)len, 0);
+    if (c->send_off >= c->send_len && len > 0) {
+        int n = send(c->fd, p, (int)len, 0);
         if (n > 0) {
             p += n;
             len -= (size_t)n;
         } else if (n < 0 && !AS_WOULDBLOCK()) {
-            /* Do not closesocket: poll thread may still be in WSAPoll on this fd. */
-            request_close_unlocked(s);
+            request_close_unlocked(c);
             fatal = 1;
         }
     }
     if (!fatal && len > 0) {
-        if (send_buf_append(s, p, len) != 0) {
-            as_mutex_unlock(&s->lock);
+        if (send_buf_append(c, p, len) != 0) {
+            as_mutex_unlock(&g_eng.lock);
             return -1;
         }
         need_pollout = 1;
     }
-    as_mutex_unlock(&s->lock);
+    as_mutex_unlock(&g_eng.lock);
     if (need_pollout || fatal) {
-        /* Wake poll so it rebuilds the fd set with POLLOUT, or notices CLOSE. */
-        as_socket_wakeup(s);
+        engine_wakeup();
     }
     return fatal ? -1 : 0;
 }
 
-as_event *as_socket_take_events(as_socket *s, size_t *out_n) {
+void as_conn_close(int conn_id) {
+    as_conn *c;
+
+    engine_init_once();
+    if (conn_id <= 0) {
+        return;
+    }
+    as_mutex_lock(&g_eng.lock);
+    c = conn_by_id_unlocked(conn_id);
+    if (c && !c->closing) {
+        request_close_unlocked(c);
+    }
+    as_mutex_unlock(&g_eng.lock);
+    engine_wakeup();
+}
+
+void as_server_close(void) {
+    engine_init_once();
+    as_mutex_lock(&g_eng.lock);
+    if (g_eng.listen_fd != AS_INVALID_FD) {
+        g_eng.listen_close_requested = 1;
+    }
+    as_mutex_unlock(&g_eng.lock);
+    engine_wakeup();
+}
+
+void as_engine_stop(void) {
+    size_t i;
+
+    engine_init_once();
+    g_eng.running = 0;
+    engine_wakeup();
+    join_thread();
+
+    as_mutex_lock(&g_eng.lock);
+    for (i = 0; i < g_eng.conn_count; i++) {
+        as_conn *c = &g_eng.conns[i];
+        if (c->fd != AS_INVALID_FD && !c->close_emitted) {
+            emit_close_unlocked(c);
+        } else {
+            close_fd_slot(&c->fd);
+        }
+        conn_free_send(c);
+    }
+    g_eng.conn_count = 0;
+    g_eng.listen_close_requested = 0;
+    close_fd_slot(&g_eng.listen_fd);
+    close_fd_slot(&g_eng.wakeup_rd);
+    close_fd_slot(&g_eng.wakeup_wr);
+    as_mutex_unlock(&g_eng.lock);
+}
+
+as_event *as_take_events(size_t *out_n) {
     as_event *out;
 
-    if (!s || !out_n) {
-        if (out_n) {
-            *out_n = 0;
-        }
+    engine_init_once();
+    if (!out_n) {
         return NULL;
     }
-    as_mutex_lock(&s->lock);
-    out = s->q;
-    *out_n = s->q_count;
-    s->q = NULL;
-    s->q_count = 0;
-    s->q_cap = 0;
-    as_mutex_unlock(&s->lock);
+    as_mutex_lock(&g_eng.lock);
+    out = g_eng.q;
+    *out_n = g_eng.q_count;
+    g_eng.q = NULL;
+    g_eng.q_count = 0;
+    g_eng.q_cap = 0;
+    as_mutex_unlock(&g_eng.lock);
     return out;
 }
 
@@ -727,4 +1096,130 @@ void as_events_free(as_event *evs, size_t n) {
         free(evs[i].payload);
     }
     free(evs);
+}
+
+/* ---- Task 1 compat wrappers (remove in Task 4) ---- */
+
+struct as_socket {
+    int stopped;
+    int current_conn_id;
+};
+
+as_socket *as_socket_listen(const char *host, int port, char *err, size_t errlen) {
+    as_socket *s;
+
+    if (as_listen(host, port, err, errlen) != 0) {
+        return NULL;
+    }
+    s = (as_socket *)calloc(1, sizeof(as_socket));
+    if (!s) {
+        as_server_close();
+        as_engine_stop();
+        AS_SETERR(err, errlen, "out of memory");
+        return NULL;
+    }
+    return s;
+}
+
+void as_socket_wakeup(as_socket *s) {
+    (void)s;
+    engine_init_once();
+    engine_wakeup();
+}
+
+void as_socket_stop(as_socket *s) {
+    if (!s || s->stopped) {
+        return;
+    }
+    as_server_close();
+    as_engine_stop();
+    s->stopped = 1;
+    /* Keep current_conn_id so a subsequent take_events still delivers CLOSE. */
+}
+
+void as_socket_destroy(as_socket *s) {
+    as_event *evs;
+    size_t n = 0;
+
+    if (!s) {
+        return;
+    }
+    as_socket_stop(s);
+    evs = as_take_events(&n);
+    as_events_free(evs, n);
+    free(s);
+}
+
+int as_socket_send(as_socket *s, const void *data, size_t len) {
+    if (!s || s->stopped || s->current_conn_id <= 0) {
+        return -1;
+    }
+    return as_conn_send(s->current_conn_id, data, len);
+}
+
+as_event *as_socket_take_events(as_socket *s, size_t *out_n) {
+    as_event *raw;
+    as_event *out;
+    size_t n = 0;
+    size_t i;
+    size_t m = 0;
+
+    if (!s || !out_n) {
+        if (out_n) {
+            *out_n = 0;
+        }
+        return NULL;
+    }
+    raw = as_take_events(&n);
+    if (!raw || n == 0) {
+        *out_n = 0;
+        as_events_free(raw, n);
+        return NULL;
+    }
+    out = (as_event *)calloc(n, sizeof(as_event));
+    if (!out) {
+        as_events_free(raw, n);
+        *out_n = 0;
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        as_event *e = &raw[i];
+        if (e->type == AS_EVT_ACCEPT) {
+            if (s->current_conn_id <= 0) {
+                s->current_conn_id = e->conn_id;
+                out[m].type = AS_EVT_OPEN;
+                out[m].conn_id = e->conn_id;
+                out[m].payload = NULL;
+                out[m].len = 0;
+                m++;
+            } else {
+                as_conn_close(e->conn_id);
+            }
+            continue;
+        }
+        if (e->type == AS_EVT_OPEN) {
+            /* Outbound; DAP compat ignores unless it is the tracked conn. */
+            if (s->current_conn_id == e->conn_id) {
+                out[m] = *e;
+                m++;
+            }
+            continue;
+        }
+        if (s->current_conn_id > 0 && e->conn_id == s->current_conn_id) {
+            out[m] = *e;
+            e->payload = NULL;
+            m++;
+            if (e->type == AS_EVT_CLOSE) {
+                s->current_conn_id = 0;
+            }
+        }
+    }
+    as_events_free(raw, n);
+    if (m == 0) {
+        free(out);
+        *out_n = 0;
+        return NULL;
+    }
+    *out_n = m;
+    return out;
 }
