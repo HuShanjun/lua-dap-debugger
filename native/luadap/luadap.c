@@ -4,7 +4,9 @@
 #include "coro_registry.h"
 #include "dap_session.h"
 
-#ifdef _WIN32
+#ifdef LUADAP_STATIC
+#define LUADAP_API
+#elif defined(_WIN32)
 #define LUADAP_API __declspec(dllexport)
 #else
 #define LUADAP_API __attribute__((visibility("default")))

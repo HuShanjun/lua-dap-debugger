@@ -60,6 +60,7 @@ link_directories(bin)
 add_subdirectory(native/common)
 add_subdirectory(native/asyncsocket)
 add_subdirectory(native/luadap)
+add_subdirectory(tools/lua-runner)
 
 # main (sol2) and luasocket are 5.4-only. sol2/luasocket live under gitignored
 # /3rd. Skip them when absent so CI can configure lua + asyncsocket + luadap
