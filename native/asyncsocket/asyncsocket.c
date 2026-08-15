@@ -6,6 +6,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#endif
+
+#ifdef ASYNCSOCKET_STATIC
+#define ASYNCSOCKET_API
+#elif defined(_WIN32)
 #define ASYNCSOCKET_API __declspec(dllexport)
 #else
 #include <time.h>
