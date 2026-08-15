@@ -1,8 +1,5 @@
 local asyncsocket = require("asyncsocket")
 local json = require("lua-runtime.dkjson")
--- luasocket is optional: used only for a short sleep so listen/pause pumps
--- do not spin the CPU. All DAP I/O goes through asyncsocket.
-local socket_ok, socket = pcall(require, "socket")
 
 local M = {}
 
@@ -29,9 +26,7 @@ local state = {
 }
 
 local function short_sleep()
-    if socket_ok and socket.sleep then
-        socket.sleep(0.001)
-    end
+    asyncsocket.sleep(0.001)
 end
 
 local function env_host_port(host, port)

@@ -5,8 +5,10 @@
 #include "poll_loop.h"
 
 #ifdef _WIN32
+#include <windows.h>
 #define ASYNCSOCKET_API __declspec(dllexport)
 #else
+#include <time.h>
 #define ASYNCSOCKET_API __attribute__((visibility("default")))
 #endif
 
@@ -204,6 +206,27 @@ static int l_pump(lua_State *L) {
     return fire_events(L, evs, n, cbtable);
 }
 
+static int l_sleep(lua_State *L) {
+    double sec = luaL_checknumber(L, 1);
+    if (sec < 0) {
+        sec = 0;
+    }
+#ifdef _WIN32
+    Sleep((DWORD)(sec * 1000.0 + 0.5));
+#else
+    {
+        struct timespec ts;
+        ts.tv_sec = (time_t)sec;
+        ts.tv_nsec = (long)((sec - (double)ts.tv_sec) * 1e9);
+        if (ts.tv_nsec < 0) {
+            ts.tv_nsec = 0;
+        }
+        nanosleep(&ts, NULL);
+    }
+#endif
+    return 0;
+}
+
 static const luaL_Reg sock_methods[] = {
     {"on_open", sock_on_open},
     {"on_message", sock_on_message},
@@ -233,5 +256,7 @@ ASYNCSOCKET_API int luaopen_asyncsocket(lua_State *L) {
     lua_setfield(L, -2, "listen");
     lua_pushcfunction(L, l_pump);
     lua_setfield(L, -2, "pump");
+    lua_pushcfunction(L, l_sleep);
+    lua_setfield(L, -2, "sleep");
     return 1;
 }
