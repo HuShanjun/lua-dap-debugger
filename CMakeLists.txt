@@ -53,4 +53,21 @@ add_subdirectory(3rd/lua-5.4.8)
 add_subdirectory(3rd/luasocket)
 add_subdirectory(main)
 
+# luasocket's CMake omits luasocket.c, so socket.dll has no luaopen_*.
+# Add the module entry and install it where require("socket.core") looks
+# (package.cpath bin/?.dll → bin/socket/core.dll).
+if(TARGET luasocket_shared)
+    target_sources(luasocket_shared PRIVATE
+        ${CMAKE_SOURCE_DIR}/3rd/luasocket/src/luasocket.c
+    )
+    add_custom_target(luasocket_core_install ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${OUTPUT_BIN_DIR}/socket"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:luasocket_shared>"
+            "${OUTPUT_BIN_DIR}/socket/core.dll"
+        DEPENDS luasocket_shared
+        COMMENT "Install socket.core.dll for require(\"socket.core\")"
+    )
+endif()
+
 # 后续可以在这里添加库、子目录和测试
