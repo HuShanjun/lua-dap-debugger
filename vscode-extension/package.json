@@ -1,0 +1,86 @@
+{
+  "name": "lua-dap-debugger",
+  "displayName": "Lua DAP Debugger",
+  "description": "通用 Lua 调试器 — 基于 Debug Adapter Protocol",
+  "version": "0.1.0",
+  "publisher": "lua-dap",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Debuggers"],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onDebug"
+  ],
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "lua-dap",
+        "label": "Lua DAP",
+        "languages": ["lua"],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "要调试的 Lua 文件"
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "传递给程序的参数"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "工作目录"
+              },
+              "luaexe": {
+                "type": "string",
+                "description": "Lua 解释器路径，如 \"lua\" 或 \"lua5.4\""
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "host": {
+                "type": "string",
+                "description": "调试后端地址"
+              },
+              "port": {
+                "type": "number",
+                "description": "调试后端端口"
+              }
+            }
+          }
+        },
+        "configurations": [
+          {
+            "type": "lua-dap",
+            "request": "launch",
+            "name": "Lua DAP: Launch",
+            "program": "${workspaceFolder}/main.lua",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "luaexe": "lua"
+          },
+          {
+            "type": "lua-dap",
+            "request": "attach",
+            "name": "Lua DAP: Attach",
+            "host": "127.0.0.1",
+            "port": 8172
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
