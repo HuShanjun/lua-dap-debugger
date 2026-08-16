@@ -92,10 +92,31 @@ static void test_framed(void) {
     circle_buffer_destroy(cb);
 }
 
+static void test_free_empty_smoke(void) {
+    circle_buffer *cb = circle_buffer_create(64, 1);
+    CHECK(cb != NULL);
+    uint8_t chunk[40];
+    memset(chunk, 0xab, sizeof(chunk));
+    for (int i = 0; i < 50; i++)
+        CHECK(circle_buffer_push_raw_one(cb, chunk, sizeof(chunk)) == 0);
+    uint8_t out[40];
+    while (circle_buffer_can_pop(cb)) {
+        uint32_t n = circle_buffer_pop_raw(cb, out, sizeof(out));
+        CHECK(n > 0);
+    }
+    /* push again after drain — reclaim path exercised inside write_bytes */
+    for (int i = 0; i < 20; i++)
+        CHECK(circle_buffer_push_raw_one(cb, chunk, sizeof(chunk)) == 0);
+    while (circle_buffer_can_pop(cb))
+        (void)circle_buffer_pop_raw(cb, out, sizeof(out));
+    circle_buffer_destroy(cb);
+}
+
 int main(void) {
     test_create_destroy();
     test_raw_roundtrip();
     test_framed();
+    test_free_empty_smoke();
     if (g_fail) {
         fprintf(stderr, "circle_buffer_test FAILED\n");
         return 1;
