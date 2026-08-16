@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 set(LUADAP_SOURCES
     luadap.c
     coro_registry.c
+    state_registry.c
     dap_framing.c
     dap_json.c
     dap_sync.c

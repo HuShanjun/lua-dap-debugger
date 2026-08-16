@@ -17,9 +17,9 @@
 static int l_start(lua_State *L) {
     const char *host = luaL_checkstring(L, 1);
     int port = (int)luaL_checkinteger(L, 2);
-    int wait = 1;
-    if (!lua_isnoneornil(L, 3)) wait = lua_toboolean(L, 3);
-    if (dap_session_start(L, host, port, wait) != 0)
+    int wait = lua_isnoneornil(L, 3) ? 1 : lua_toboolean(L, 3);
+    const char *name = lua_isnoneornil(L, 4) ? NULL : luaL_checkstring(L, 4);
+    if (dap_session_start_ex(L, host, port, wait, name) != 0)
         return luaL_error(L, "luadap.start failed");
     return 0;
 }

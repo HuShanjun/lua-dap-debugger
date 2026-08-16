@@ -1,5 +1,6 @@
 #include "dap_session.h"
 #include "coro_registry.h"
+#include "state_registry.h"
 #include "dap_framing.h"
 #include "dap_json.h"
 #include "dap_sync.h"
@@ -47,6 +48,8 @@ struct dap_session {
     int hook_installed;
     int next_ref;
     int seq;
+    char host[128];
+    int port;
     dap_recv_buf recv_buf;
     dap_bp_file *bp_files;
     size_t bp_n;
@@ -1153,6 +1156,7 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     g_sess.hook_installed = 0;
     coro_registry_uninstall_wrappers(L);
     coro_registry_clear(L);
+    state_registry_clear();
     g_sess.client_open = 0;
     g_sess.dap_conn_id = 0;
     g_sess.listening = 0;
@@ -1251,14 +1255,65 @@ out:
     return rc;
 }
 
+static void start_wait_configured(lua_State *L) {
+    while (!g_sess.configured && !g_sess.dead) {
+        if (dap_session_update(L) != 0) {
+            dap_session_shutdown(L, NULL);
+            break;
+        }
+        short_sleep();
+    }
+    /* Host thread after wait: same thread that will run debugee code. */
+    if (g_sess.client_open && !g_sess.dead && !g_sess.hook_installed) {
+        lua_debug_install_hook(L);
+        g_sess.hook_installed = 1;
+        coro_registry_install_hooks_all();
+    } else if (g_sess.client_open && !g_sess.dead && g_sess.hook_installed) {
+        lua_debug_install_hook(L);
+    }
+}
+
+static int start_join_state(lua_State *L, const char *name) {
+    if (state_registry_has(L)) return 0;
+    if (state_registry_add(L, name) == 0) return -1;
+    /* coro_registry_track_main is Task 5. Do not track a second main via
+     * coro_registry_track: is_main_thread would steal global threadId 1. */
+    if (g_sess.hook_installed)
+        lua_debug_install_hook(L);
+    coro_registry_install_wrappers(L);
+    return 0;
+}
+
 int dap_session_start(lua_State *L, const char *host, int port, int wait) {
+    return dap_session_start_ex(L, host, port, wait, NULL);
+}
+
+int dap_session_start_ex(lua_State *L, const char *host, int port, int wait,
+                         const char *name) {
     char err[256];
     int rc = 0;
+
+    if (!host) host = "";
+    if (name && !name[0]) name = NULL;
 
     dap_mutex_init();
     dap_mutex_lock();
 
-    if (g_sess.listening || g_sess.recv_buf.data || g_sess.bp_files)
+    if (g_sess.listening) {
+        if (strcmp(host, g_sess.host) != 0 || port != g_sess.port) {
+            rc = -1;
+            goto out;
+        }
+        if (start_join_state(L, name) != 0) {
+            rc = -1;
+            goto out;
+        }
+        if (wait)
+            start_wait_configured(L);
+        goto out;
+    }
+
+    if (g_sess.recv_buf.data || g_sess.bp_files)
         dap_session_shutdown(L, NULL);
     bp_clear_all();
     dap_recv_buf_free(&g_sess.recv_buf);
@@ -1266,6 +1321,7 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
     paused_clear_all();
     step_clear_all();
     queue_clear(0);
+    state_registry_clear();
     dap_recv_buf_init(&g_sess.recv_buf);
     g_sess.next_ref = 1000;
     g_sess.dap_conn_id = 0;
@@ -1279,28 +1335,21 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
         rc = -1;
         goto out;
     }
+    snprintf(g_sess.host, sizeof(g_sess.host), "%s", host);
+    g_sess.port = port;
     g_sess.listening = 1;
     fprintf(stderr, "[luadap] listening on %s:%d\n", host, port);
 
+    if (state_registry_add(L, name) == 0) {
+        rc = -1;
+        goto out;
+    }
     coro_registry_clear(L);
-    coro_registry_track(L, L, "main");
+    coro_registry_track(L, L, name ? name : "main");
     coro_registry_install_wrappers(L);
 
-    if (wait) {
-        while (!g_sess.configured && !g_sess.dead) {
-            if (dap_session_update(L) != 0) {
-                dap_session_shutdown(L, NULL);
-                break;
-            }
-            short_sleep();
-        }
-        /* Host thread after wait: same thread that will run debugee code. */
-        if (g_sess.client_open && !g_sess.dead && !g_sess.hook_installed) {
-            lua_debug_install_hook(L);
-            g_sess.hook_installed = 1;
-            coro_registry_install_hooks_all();
-        }
-    }
+    if (wait)
+        start_wait_configured(L);
 
 out:
     dap_mutex_unlock();

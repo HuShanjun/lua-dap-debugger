@@ -245,7 +245,13 @@ static int l_wrapped_wrap(lua_State *L) {
 }
 
 void coro_registry_install_wrappers(lua_State *mainL) {
-    if (!mainL || g_wrapped) return;
+    if (!mainL) return;
+    lua_rawgetp(mainL, LUA_REGISTRYINDEX, &key_orig_create);
+    if (!lua_isnil(mainL, -1)) {
+        lua_pop(mainL, 1);
+        return;
+    }
+    lua_pop(mainL, 1);
     lua_getglobal(mainL, "coroutine");
     if (!lua_istable(mainL, -1)) {
         lua_pop(mainL, 1);
