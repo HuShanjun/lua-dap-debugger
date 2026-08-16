@@ -3,6 +3,7 @@
 #include "lua_compat.h"
 #include "coro_registry.h"
 #include "dap_session.h"
+#include "dap_sync.h"
 
 #ifdef LUADAP_STATIC
 #define LUADAP_API
@@ -36,7 +37,10 @@ static int l_track(lua_State *L) {
     int id;
     if (!co) return luaL_error(L, "track: expected thread");
     if (!lua_isnoneornil(L, 2)) name = luaL_checkstring(L, 2);
+    dap_mutex_init();
+    dap_mutex_lock();
     id = coro_registry_track(L, co, name);
+    dap_mutex_unlock();
     if (id == 0) return luaL_error(L, "track failed");
     lua_pushinteger(L, id);
     return 1;

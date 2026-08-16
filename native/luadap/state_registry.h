@@ -7,6 +7,7 @@ int state_registry_count(void);
 int state_registry_add(lua_State *mainL, const char *name_opt); /* id>=1 or 0 */
 int state_registry_has(lua_State *mainL);
 const char *state_registry_name(lua_State *mainL);
+lua_State *state_registry_main_at(int index); /* 0 .. count-1, else NULL */
 void state_registry_clear(void);
 
 #endif

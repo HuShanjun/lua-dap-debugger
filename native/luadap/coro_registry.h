@@ -4,6 +4,8 @@
 #include <lua.h>
 #include <cJSON.h>
 
+/* All APIs require the caller to hold session_mutex, except the
+ * coroutine.create/wrap wrappers which take the mutex themselves. */
 void coro_registry_clear(lua_State *mainL);
 int coro_registry_track(lua_State *mainL, lua_State *co, const char *name_opt);
 int coro_registry_id_for(lua_State *co);
@@ -13,5 +15,6 @@ int coro_registry_append_threads_json(cJSON *threads_array);
 void coro_registry_install_wrappers(lua_State *mainL);
 void coro_registry_uninstall_wrappers(lua_State *mainL);
 void coro_registry_install_hooks_all(void);
+void coro_registry_clear_hooks_all(void);
 
 #endif

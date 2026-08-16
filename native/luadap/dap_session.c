@@ -1107,7 +1107,12 @@ static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req) {
     g_sess.client_open = 0;
     g_sess.seq = 0;
 
-    lua_debug_clear_hook(L);
+    {
+        int si, sn = state_registry_count();
+        for (si = 0; si < sn; si++)
+            lua_debug_clear_hook(state_registry_main_at(si));
+    }
+    coro_registry_clear_hooks_all();
     lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
     dap_recv_buf_free(&g_sess.recv_buf);
@@ -1151,10 +1156,16 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
         send_event("terminated", cJSON_CreateObject());
     }
 
-    lua_debug_clear_hook(L);
+    {
+        int si, sn = state_registry_count();
+        for (si = 0; si < sn; si++) {
+            lua_State *m = state_registry_main_at(si);
+            lua_debug_clear_hook(m);
+            coro_registry_uninstall_wrappers(m);
+        }
+    }
     lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
-    coro_registry_uninstall_wrappers(L);
     coro_registry_clear(L);
     state_registry_clear();
     g_sess.client_open = 0;
@@ -1276,8 +1287,7 @@ static void start_wait_configured(lua_State *L) {
 static int start_join_state(lua_State *L, const char *name) {
     if (state_registry_has(L)) return 0;
     if (state_registry_add(L, name) == 0) return -1;
-    /* coro_registry_track_main is Task 5. Do not track a second main via
-     * coro_registry_track: is_main_thread would steal global threadId 1. */
+    if (coro_registry_track(L, L, name) == 0) return -1;
     if (g_sess.hook_installed)
         lua_debug_install_hook(L);
     coro_registry_install_wrappers(L);

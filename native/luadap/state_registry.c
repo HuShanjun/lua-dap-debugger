@@ -45,6 +45,11 @@ const char *state_registry_name(lua_State *mainL) {
     return NULL;
 }
 
+lua_State *state_registry_main_at(int index) {
+    if (index < 0 || (size_t)index >= g_n) return NULL;
+    return g_states[index].mainL;
+}
+
 int state_registry_add(lua_State *mainL, const char *name_opt) {
     state_entry *e;
     int id;
