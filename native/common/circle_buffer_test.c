@@ -64,9 +64,38 @@ static void test_raw_roundtrip(void) {
     circle_buffer_destroy(cb);
 }
 
+static void test_framed(void) {
+    circle_buffer *cb = circle_buffer_create(128, 0);
+    CHECK(cb != NULL);
+
+    uint32_t ctx_in = 0x12345678u;
+    circle_buf parts[2] = { { "hello", 5 }, { "world", 5 } };
+    CHECK(circle_buffer_push_buffer(cb, &ctx_in, sizeof(ctx_in), parts, 2, 0) == 0);
+
+    uint32_t ctx_out = 0;
+    circle_buf out[2];
+    uint32_t count = 2;
+    CHECK(circle_buffer_pop_buffer(cb, &ctx_out, sizeof(ctx_out), out, &count) == 1);
+    CHECK(ctx_out == ctx_in);
+    CHECK(count == 2);
+    CHECK(out[0].size == 5 && memcmp(out[0].data, "hello", 5) == 0);
+    CHECK(out[1].size == 5 && memcmp(out[1].data, "world", 5) == 0);
+
+    /* merge: one segment, concatenated bytes */
+    CHECK(circle_buffer_push_buffer(cb, &ctx_in, sizeof(ctx_in), parts, 2, 1) == 0);
+    count = 1;
+    CHECK(circle_buffer_pop_buffer(cb, &ctx_out, sizeof(ctx_out), out, &count) == 1);
+    CHECK(count == 1);
+    CHECK(out[0].size == 10);
+    CHECK(memcmp(out[0].data, "helloworld", 10) == 0);
+
+    circle_buffer_destroy(cb);
+}
+
 int main(void) {
     test_create_destroy();
     test_raw_roundtrip();
+    test_framed();
     if (g_fail) {
         fprintf(stderr, "circle_buffer_test FAILED\n");
         return 1;

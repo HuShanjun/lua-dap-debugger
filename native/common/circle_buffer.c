@@ -228,13 +228,127 @@ uint32_t circle_buffer_waiting_count(const circle_buffer *cb) {
     return (uint32_t)(p - q);
 }
 
+static int ensure_scratch(circle_buffer *cb, size_t need) {
+    if (cb->scratch_cap >= need)
+        return 0;
+    uint8_t *p = (uint8_t *)realloc(cb->scratch, need);
+    if (!p)
+        return -1;
+    cb->scratch = p;
+    cb->scratch_cap = need;
+    return 0;
+}
+
+static int read_bytes(circle_buffer *cb, cb_block **p_read, uint32_t *p_rpos,
+                      void *dst, size_t n) {
+    uint8_t *cur = (uint8_t *)dst;
+    while (n) {
+        uint32_t wpos = atomic_load_explicit(&(*p_read)->write_pos, memory_order_acquire);
+        uint32_t left = wpos - *p_rpos;
+        assert(left > 0);
+        uint32_t chunk = (uint32_t)n;
+        if (n > left) {
+            assert(wpos == cb->payload_cap);
+            chunk = left;
+        }
+        memcpy(cur, cb_payload(*p_read) + *p_rpos, chunk);
+        cur += chunk;
+        *p_rpos += chunk;
+        n -= chunk;
+        if (*p_rpos != cb->payload_cap)
+            break;
+        *p_read = atomic_load_explicit(&(*p_read)->next, memory_order_acquire);
+        *p_rpos = 0;
+    }
+    return 0;
+}
+
 int circle_buffer_push_buffer(circle_buffer *cb, const void *context, size_t context_size,
                               const circle_buf *bufs, uint32_t count, int merge) {
-    (void)cb; (void)context; (void)context_size; (void)bufs; (void)count; (void)merge;
-    return -1;
+    if (!cb)
+        return -1;
+    if (context_size && !context)
+        return -1;
+
+    cb_block *start, *end, *read_buf;
+    uint32_t wpos;
+    begin_write(cb, &start, &end, &read_buf, &wpos);
+
+    if (context_size) {
+        if (write_bytes(cb, &end, &wpos, read_buf, context, context_size) != 0)
+            return -1;
+    }
+
+    if (merge && count) {
+        uint32_t one = 1;
+        if (write_bytes(cb, &end, &wpos, read_buf, &one, sizeof(one)) != 0)
+            return -1;
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < count; i++)
+            total += bufs[i].size;
+        if (write_bytes(cb, &end, &wpos, read_buf, &total, sizeof(total)) != 0)
+            return -1;
+        for (uint32_t i = 0; i < count; i++) {
+            if (write_bytes(cb, &end, &wpos, read_buf, bufs[i].data, bufs[i].size) != 0)
+                return -1;
+        }
+    } else {
+        if (write_bytes(cb, &end, &wpos, read_buf, &count, sizeof(count)) != 0)
+            return -1;
+        for (uint32_t i = 0; i < count; i++) {
+            if (write_bytes(cb, &end, &wpos, read_buf, &bufs[i].size, sizeof(uint32_t)) != 0)
+                return -1;
+            if (write_bytes(cb, &end, &wpos, read_buf, bufs[i].data, bufs[i].size) != 0)
+                return -1;
+        }
+    }
+
+    publish_write(cb, start, end, wpos);
+    return 0;
 }
+
 int circle_buffer_pop_buffer(circle_buffer *cb, void *context_out, size_t context_size,
                              circle_buf *bufs, uint32_t *inout_count) {
-    (void)cb; (void)context_out; (void)context_size; (void)bufs; (void)inout_count;
-    return 0;
+    if (!cb || !inout_count || !bufs)
+        return 0;
+
+    cb_block *write_buf = atomic_load_explicit(&cb->write_buf, memory_order_acquire);
+    uint32_t write_pos = atomic_load_explicit(&write_buf->write_pos, memory_order_acquire);
+    if (write_pos == cb->payload_cap)
+        return 0;
+
+    cb_block *read_buf = atomic_load_explicit(&cb->read_buf, memory_order_relaxed);
+    uint32_t read_pos = atomic_load_explicit(&read_buf->read_pos, memory_order_relaxed);
+    if (read_buf == write_buf && read_pos == write_pos)
+        return 0;
+
+    if (context_size) {
+        if (!context_out)
+            return 0;
+        read_bytes(cb, &read_buf, &read_pos, context_out, context_size);
+    }
+
+    uint32_t ncount = 0;
+    read_bytes(cb, &read_buf, &read_pos, &ncount, sizeof(ncount));
+    assert(ncount <= *inout_count);
+    *inout_count = ncount;
+
+    size_t total = 0;
+    for (uint32_t i = 0; i < ncount; i++) {
+        uint32_t sz = 0;
+        read_bytes(cb, &read_buf, &read_pos, &sz, sizeof(sz));
+        bufs[i].size = sz;
+        size_t need = total + sz;
+        if (ensure_scratch(cb, need) != 0)
+            return 0;
+        read_bytes(cb, &read_buf, &read_pos, cb->scratch + total, sz);
+        total = need;
+    }
+    for (uint32_t i = 0, off = 0; i < ncount; off += bufs[i].size, i++)
+        bufs[i].data = cb->scratch + off;
+
+    atomic_store_explicit(&read_buf->read_pos, read_pos, memory_order_release);
+    atomic_store_explicit(&cb->read_buf, read_buf, memory_order_release);
+    atomic_fetch_add_explicit(&cb->pop_count, 1, memory_order_relaxed);
+    return 1;
 }
