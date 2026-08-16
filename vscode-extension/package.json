@@ -10,7 +10,9 @@
   "categories": ["Debuggers"],
   "main": "./out/extension.js",
   "activationEvents": [
-    "onDebug"
+    "onDebug",
+    "onDebugResolve:lua-dap",
+    "onDebugAdapterProtocolTracker:lua-dap"
   ],
   "contributes": {
     "configuration": {

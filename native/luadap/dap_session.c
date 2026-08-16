@@ -544,7 +544,8 @@ static void dispatch(lua_State *L, cJSON *msg) {
     }
     if (strcmp(cmd, "initialize") == 0)
         handle_initialize(msg);
-    else if (strcmp(cmd, "attach") == 0)
+    else if (strcmp(cmd, "attach") == 0 || strcmp(cmd, "launch") == 0)
+        /* Extension may spawn lua-runner then send DAP launch; treat like attach. */
         handle_attach(msg);
     else if (strcmp(cmd, "threads") == 0)
         handle_threads(L, msg);

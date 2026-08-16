@@ -269,6 +269,8 @@ local handle_stack_trace, handle_scopes, handle_variables
 local handlers = {
     initialize = handle_initialize,
     attach = handle_attach,
+    -- VS Code Launch configs send DAP "launch"; process is already running.
+    launch = handle_attach,
     threads = handle_threads,
     setExceptionBreakpoints = handle_set_exception_breakpoints,
     setBreakpoints = handle_set_breakpoints,

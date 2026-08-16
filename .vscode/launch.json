@@ -2,7 +2,16 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Extension Host: lua-dap",
+      "name": "Debug Sample",
+      "type": "node",
+      "request": "attach",
+      "debugServer": 8172,
+      "sourceMapPathOverrides": {
+        "sample/script/": "${workspaceRoot}/sample/script/",
+      }
+    },
+    {
+      "name": "1. Start Extension Host (do this first)",
       "type": "extensionHost",
       "request": "launch",
       "args": [
@@ -13,7 +22,7 @@
       ]
     },
     {
-      "name": "Lua DAP: Launch current file",
+      "name": "2. Launch Lua file (use in Extension Host window)",
       "type": "lua-dap",
       "request": "launch",
       "program": "${file}",
@@ -21,11 +30,11 @@
       "runnerPath": "${workspaceFolder}/bin/lua-runner.exe"
     },
     {
-      "name": "Lua DAP: Attach",
+      "name": "3. Attach DAP (use in Extension Host window)",
       "type": "lua-dap",
       "request": "attach",
       "host": "127.0.0.1",
       "port": 8172
-    }
+    },
   ]
 }

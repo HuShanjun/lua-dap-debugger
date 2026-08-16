@@ -59,8 +59,12 @@ def main():
         assert init_resp.get("success") is True, init_resp
         ev = c.wait_for(lambda m: m.get("type") == "event" and m.get("event") == "initialized")
         assert ev["event"] == "initialized"
-        c.send_request("attach", {})
-        c.wait_for(lambda m: m.get("type") == "response" and m.get("command") == "attach")
+        # VS Code "request":"launch" sends DAP launch (not attach); must succeed.
+        c.send_request("launch", {})
+        launch_resp = c.wait_for(
+            lambda m: m.get("type") == "response" and m.get("command") == "launch"
+        )
+        assert launch_resp.get("success") is True, launch_resp
         c.send_request("setExceptionBreakpoints", {"filters": []})
         c.wait_for(
             lambda m: m.get("type") == "response" and m.get("command") == "setExceptionBreakpoints"

@@ -61,7 +61,7 @@ int main(int argc, char* args[])
 {
     sol::state lua;
     lua.open_libraries();
-    AddScriptPath(lua, "E:/demo/lua-dap-debugger/script");
+    AddScriptPath(lua, "E:/demo/lua-dap-debugger/sample/script");
     AddLibraryPath(lua, "E:/demo/lua-dap-debugger/bin");
     std::cout << "hello world" << std::endl;
 
@@ -81,7 +81,7 @@ int main(int argc, char* args[])
         return 1;
     }
 
-    RunFile(lua, "E:/demo/lua-dap-debugger/script/sample/main.lua");
+    RunFile(lua, "E:/demo/lua-dap-debugger/sample/script/main.lua");
 
     // Pump asyncsocket DAP every tick. If the script defines update(), call it too.
     int update_count = 0;

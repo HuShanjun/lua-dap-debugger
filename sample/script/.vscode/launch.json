@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "1. Start Extension Host (do this first)",
+        "type": "extensionHost",
+        "request": "launch",
+        "args": [
+          "--extensionDevelopmentPath=${workspaceFolder}/vscode-extension"
+        ],
+        "outFiles": [
+          "${workspaceFolder}/vscode-extension/out/**/*.js"
+        ]
+      },
+      {
+        "name": "2. Launch Lua file (use in Extension Host window)",
+        "type": "lua-dap",
+        "request": "launch",
+        "program": "${file}",
+        "cwd": "${workspaceFolder}",
+        "runnerPath": "E:/demo/lua-dap-debugger/bin/lua-runner.exe"
+      },
+      {
+        "name": "3. Attach DAP (use in Extension Host window)",
+        "type": "lua-dap",
+        "request": "attach",
+        "host": "127.0.0.1",
+        "port": 8172
+      }
+    ]
+  }
+  

@@ -35,7 +35,8 @@ message(STATUS "OUTPUT_BIN_DIR: ${OUTPUT_BIN_DIR}")
 
 
 if(MSVC)
-    add_compile_options(/W4)
+    add_compile_options(/W4 /wd4334)
+    add_compile_options(/D_CRT_SECURE_NO_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -70,6 +71,6 @@ link_directories(${OUTPUT_BIN_DIR})
 add_subdirectory(native/common)
 add_subdirectory(native/asyncsocket)
 add_subdirectory(native/luadap)
-add_subdirectory(tools/lua-runner)
-add_subdirectory(main)
+add_subdirectory(native/lua-runner)
+add_subdirectory(sample)
 # 后续可以在这里添加库、子目录和测试

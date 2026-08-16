@@ -3,4 +3,4 @@
 /build
 /.vscode
 /.superpowers
-/script/test/__pycache__
+**/__pycache__
