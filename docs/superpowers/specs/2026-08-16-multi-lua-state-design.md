@@ -1,7 +1,7 @@
 # 多 lua_State 共用 DAP 会话 — 设计
 
 **日期：** 2026-08-16  
-**状态：** 已批准待实现  
+**状态：** 已实现  
 **范围：** `native/luadap`（`dap_session` / `coro_registry` / `lua_debug` / `luadap.c`）、必要时 `asyncsocket` 泵约定、宿主用法、测试；VS Code 扩展无需改协议面（仍一个 TCP DAP）
 
 ---

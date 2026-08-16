@@ -38,7 +38,7 @@ lua-dap-debugger/
 
 ```lua
 local dap = require("luadap")
-dap.start(host, port, true)   -- true：阻塞到 DAP configurationDone
+dap.start(host, port, true [, name])   -- true：阻塞到 DAP configurationDone；name 可选
 -- 业务脚本 / 游戏循环
 dap.update()                  -- 每帧调用
 dap.track(co, "worker")       -- 可选；start 已包装 coroutine.create / wrap
@@ -53,6 +53,36 @@ dap.track(co, "worker")       -- 可选；start 已包装 coroutine.create / wra
 C++ 宿主等价写法见 `sample/main.cpp`：`require("luadap")` → `start(..., false)` → `RunFile(sample/script/main.lua)` → 循环 `update()`。
 
 内部传输走通用 `asyncsocket` C API。DAP 仍只接受 **一个** 调试客户端：第二个入站连接会被关掉。`disconnect` 只结束当前 client，**不停 listen**，所以可再 F5 附加。
+
+---
+
+## 多 `lua_State` 共用 DAP
+
+同一进程内多个独立 `lua_State` 可 **共用一次 DAP listen / 同一 VS Code 会话**。每个 state 各自调用 `dap.start(host, port, wait [, name])`：
+
+- **首次** `start`：在本机 `host:port` 上 listen。
+- **后续** 同 `host` + `port`：**自动 join** 已有会话（无需再开端口）。
+- **`name`（可选）：** Threads 面板前缀。仅一个 state 且未传 `name` → 主线程名 `main`；多 state 未传 → `state-N`。
+- **`(host, port)` 与已有会话不一致** → 失败。
+
+```lua
+-- Thread 1
+dap.start("127.0.0.1", 8172, false, "logic")
+-- Thread 2（join，不另开 listen）
+dap.start("127.0.0.1", 8172, false, "ui")
+```
+
+各 state 在 **拥有它的 OS 线程** 上驱动 Lua 并调用 `dap.update()`。断点只暂停命中的执行流；**其它 OS 线程上的 state 继续真并行**。多个 DAP thread 可同时处于 stopped（`allThreadsStopped: false`）；`continue` / `step*` 须带正确的 `threadId`。
+
+### 跨线程约定
+
+| 规则 | 说明 |
+|------|------|
+| **一 L 一 OS 线程** | 每个 `lua_State`（含其协程）只由创建/驱动它的线程进入 Lua；其它线程不得对该 `L` 做 `lua_getstack` / evaluate。 |
+| **持锁不进用户 Lua** | 会话互斥锁保护 DAP 共享结构；`pause_loop` 睡眠前必须放锁；禁止持锁调用用户脚本。 |
+| **同线程暂停挡兄弟 state** | 同一 OS 线程上跑多个 state 时，一个 state 进入 `pause_loop` 会阻塞该线程上其它 state 的调度（非数据竞争，是调度限制）。需要真并行请用多 OS 线程。 |
+
+回归测试：`test/test_dap_multi_state.py`（同线程双 state）、`test/test_dap_multi_state_mt.py`（跨线程双 state、并行心跳）。需先编译 `multi_state_dap_host`。
 
 ---
 
@@ -235,6 +265,8 @@ python test/test_dap_table_cycle.py
 python test/test_dap_coro_threads.py
 python test/test_dap_coro.py
 python test/test_dap_runner_handshake.py
+python test/test_dap_multi_state.py
+python test/test_dap_multi_state_mt.py
 ```
 
 测试脚本期望 `bin/lua.exe`、`bin/luadap.dll`、`bin/asyncsocket.dll`（及 runner 测试用的 `bin/lua-runner.exe`）已就绪。
