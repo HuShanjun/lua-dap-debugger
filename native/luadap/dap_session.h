@@ -17,12 +17,9 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req /* nullable */);
  * Returns malloc'd string; caller frees. */
 char *dap_session_normalize_path(const char *path);
 
-/* Breakpoint map: 1 if path+line has a BP. Empty/missing condition is NULL;
- * caller evals a non-empty condition (failure → no hit). */
-int dap_session_bp_should_stop(const char *norm_path, int line);
-
-/* Stored condition for path+line, or NULL if missing/empty. Session-owned. */
-const char *dap_session_bp_condition(const char *norm_path, int line);
+/* Snapshot BP table under session_mutex. 1 if path+line has a BP.
+ * *cond_out is a malloc'd copy (NULL if missing/empty); caller frees. */
+int dap_session_bp_snapshot(const char *norm_path, int line, char **cond_out);
 
 /* Step mode: 0 none, 1 in, 2 over, 3 out (debugger.lua step / step_depth). */
 enum {

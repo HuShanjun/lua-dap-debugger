@@ -123,6 +123,15 @@ static void format_thread_name(const coro_entry *e, char *out, size_t outsz) {
         snprintf(out, outsz, "%s/%s", state, e->name);
 }
 
+static int entry_owned_by(const coro_entry *e, lua_State *self) {
+    lua_State *self_main;
+
+    if (!e || !self) return 0;
+    if (e->co == self || e->mainL == self) return 1;
+    self_main = resolve_main(self);
+    return self_main && e->mainL == self_main;
+}
+
 int coro_registry_id_for(lua_State *co) {
     size_t i;
     if (!co) return 0;
@@ -145,19 +154,21 @@ lua_State *coro_registry_state_for(int thread_id) {
 void coro_registry_purge_dead(lua_State *mainL) {
     size_t i = 0;
 
+    if (!mainL) return;
     while (i < g_n) {
         coro_entry *e = &g_entries[i];
-        lua_State *owner = e->mainL ? e->mainL : mainL;
+        lua_State *owner;
         lua_State *co;
 
         if (e->is_main) {
             i++;
             continue;
         }
-        if (!owner) {
+        if (!entry_owned_by(e, mainL)) {
             i++;
             continue;
         }
+        owner = e->mainL ? e->mainL : mainL;
         lua_rawgeti(owner, LUA_REGISTRYINDEX, e->reg_ref);
         if (!lua_isthread(owner, -1)) {
             lua_pop(owner, 1);
@@ -181,7 +192,6 @@ int coro_registry_append_threads_json(cJSON *threads_array) {
     char display[128];
 
     if (!threads_array) return -1;
-    coro_registry_purge_dead(NULL);
     for (i = 0; i < g_n; i++) {
         cJSON *th = cJSON_CreateObject();
         if (!th) return -1;
@@ -250,27 +260,42 @@ int coro_registry_track(lua_State *mainL, lua_State *co, const char *name_opt) {
     return id;
 }
 
-void coro_registry_clear(lua_State *mainL) {
-    size_t i;
-
-    for (i = 0; i < g_n; i++) {
-        lua_State *owner = g_entries[i].mainL ? g_entries[i].mainL : mainL;
-        lua_State *co = NULL;
-        if (!owner) continue;
-        lua_rawgeti(owner, LUA_REGISTRYINDEX, g_entries[i].reg_ref);
-        if (lua_isthread(owner, -1))
-            co = lua_tothread(owner, -1);
-        lua_pop(owner, 1);
-        if (co)
-            lua_debug_clear_hook(co);
-        luaL_unref(owner, LUA_REGISTRYINDEX, g_entries[i].reg_ref);
-    }
+void coro_registry_reset(void) {
     free(g_entries);
     g_entries = NULL;
     g_n = 0;
     g_cap = 0;
     g_next_id = 2;
     g_have_first_main = 0;
+}
+
+void coro_registry_clear(lua_State *mainL) {
+    size_t i = 0;
+
+    if (!mainL) {
+        coro_registry_reset();
+        return;
+    }
+    while (i < g_n) {
+        coro_entry *e = &g_entries[i];
+        lua_State *owner;
+        lua_State *co = NULL;
+
+        if (!entry_owned_by(e, mainL)) {
+            i++;
+            continue;
+        }
+        owner = e->mainL ? e->mainL : mainL;
+        lua_rawgeti(owner, LUA_REGISTRYINDEX, e->reg_ref);
+        if (lua_isthread(owner, -1))
+            co = lua_tothread(owner, -1);
+        lua_pop(owner, 1);
+        if (co)
+            lua_debug_clear_hook(co);
+        remove_at(owner, i);
+    }
+    if (g_n == 0)
+        coro_registry_reset();
 }
 
 static int l_wrapped_create(lua_State *L) {
@@ -334,18 +359,20 @@ void coro_registry_install_wrappers(lua_State *mainL) {
     lua_pop(mainL, 1);
 }
 
-void coro_registry_install_hooks_all(void) {
+void coro_registry_install_hooks_owned(lua_State *owner) {
     size_t i;
+    if (!owner) return;
     for (i = 0; i < g_n; i++) {
-        if (g_entries[i].co)
+        if (g_entries[i].co && entry_owned_by(&g_entries[i], owner))
             lua_debug_install_hook(g_entries[i].co);
     }
 }
 
-void coro_registry_clear_hooks_all(void) {
+void coro_registry_clear_hooks_owned(lua_State *owner) {
     size_t i;
+    if (!owner) return;
     for (i = 0; i < g_n; i++) {
-        if (g_entries[i].co)
+        if (g_entries[i].co && entry_owned_by(&g_entries[i], owner))
             lua_debug_clear_hook(g_entries[i].co);
     }
 }

@@ -10,5 +10,6 @@ dap.start("127.0.0.1", PORT, false, "logic")
 
 function tick()
     local x = 1
+    local t = {v = x}
     return x
 end

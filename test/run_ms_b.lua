@@ -10,5 +10,6 @@ dap.start("127.0.0.1", PORT, false, "ui")
 
 function tick()
     local y = 2
+    local t = {v = y}
     return y
 end

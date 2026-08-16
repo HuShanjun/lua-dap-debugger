@@ -1,6 +1,7 @@
 #include "lua_debug.h"
 #include "coro_registry.h"
 #include "dap_session.h"
+#include "dap_sync.h"
 
 #include <lauxlib.h>
 #include "lua_compat.h"
@@ -9,6 +10,7 @@
 #include <string.h>
 
 #define MAX_USER_FRAMES 64
+#define FRAME_ID_STRIDE MAX_USER_FRAMES
 #define LOCALS_REF_BASE 100000
 #define UPVALS_REF_BASE 200000
 #define TABLE_REF_START 1000
@@ -26,6 +28,7 @@ typedef struct {
     int dap_ref;
     int reg_ref;
     const void *ptr;
+    lua_State *owner;
 } var_entry;
 
 static var_entry *g_vars;
@@ -306,17 +309,83 @@ int lua_debug_current_depth(lua_State *L) {
     return walk_user_frames(L, frames);
 }
 
+int lua_debug_pack_frame_id(int thread_id, int index) {
+    if (thread_id <= 0)
+        thread_id = 1;
+    if (index < 0)
+        index = 0;
+    return thread_id * FRAME_ID_STRIDE + (index % FRAME_ID_STRIDE);
+}
+
+int lua_debug_unpack_frame_index(int frame_id) {
+    if (frame_id < 0)
+        return 0;
+    return frame_id % FRAME_ID_STRIDE;
+}
+
+int lua_debug_unpack_frame_tid(int frame_id) {
+    if (frame_id < 0)
+        return 0;
+    return frame_id / FRAME_ID_STRIDE;
+}
+
 void lua_debug_reset_var_maps(lua_State *L) {
-    size_t i;
-    if (L) {
-        for (i = 0; i < g_var_n; i++)
-            luaL_unref(L, LUA_REGISTRYINDEX, g_vars[i].reg_ref);
+    size_t i = 0;
+
+    if (!L) {
+        free(g_vars);
+        g_vars = NULL;
+        g_var_n = 0;
+        g_var_cap = 0;
+        g_next_ref = TABLE_REF_START;
+        return;
     }
-    free(g_vars);
-    g_vars = NULL;
-    g_var_n = 0;
-    g_var_cap = 0;
-    g_next_ref = TABLE_REF_START;
+    while (i < g_var_n) {
+        if (g_vars[i].owner != L) {
+            i++;
+            continue;
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, g_vars[i].reg_ref);
+        if (i + 1 < g_var_n)
+            memmove(&g_vars[i], &g_vars[i + 1],
+                    (g_var_n - i - 1) * sizeof(g_vars[0]));
+        g_var_n--;
+    }
+    if (g_var_n == 0) {
+        free(g_vars);
+        g_vars = NULL;
+        g_var_cap = 0;
+        g_next_ref = TABLE_REF_START;
+    }
+}
+
+lua_State *lua_debug_var_owner(int dap_ref) {
+    size_t i;
+    for (i = 0; i < g_var_n; i++) {
+        if (g_vars[i].dap_ref == dap_ref)
+            return g_vars[i].owner;
+    }
+    return NULL;
+}
+
+int lua_debug_tid_from_varref(int variables_reference) {
+    int packed;
+    lua_State *owner;
+
+    if (variables_reference >= UPVALS_REF_BASE &&
+        variables_reference < UPVALS_REF_BASE + LOCALS_REF_BASE) {
+        packed = variables_reference - UPVALS_REF_BASE;
+        return lua_debug_unpack_frame_tid(packed);
+    }
+    if (variables_reference >= LOCALS_REF_BASE &&
+        variables_reference < UPVALS_REF_BASE) {
+        packed = variables_reference - LOCALS_REF_BASE;
+        return lua_debug_unpack_frame_tid(packed);
+    }
+    owner = lua_debug_var_owner(variables_reference);
+    if (!owner)
+        return 0;
+    return coro_registry_id_for(owner);
 }
 
 static int alloc_ref(lua_State *L, int idx) {
@@ -325,36 +394,56 @@ static int alloc_ref(lua_State *L, int idx) {
     var_entry *e;
     size_t i;
     size_t cap;
+    int dap_ref;
 
+    dap_mutex_init();
+    dap_mutex_lock();
     for (i = 0; i < g_var_n; i++) {
-        if (g_vars[i].ptr == ptr)
-            return g_vars[i].dap_ref;
+        if (g_vars[i].ptr == ptr && g_vars[i].owner == L) {
+            dap_ref = g_vars[i].dap_ref;
+            dap_mutex_unlock();
+            return dap_ref;
+        }
     }
     cap = g_var_cap;
     if (g_var_n >= cap) {
         cap = cap ? cap * 2 : 16;
         nv = (var_entry *)realloc(g_vars, cap * sizeof(*nv));
-        if (!nv) return 0;
+        if (!nv) {
+            dap_mutex_unlock();
+            return 0;
+        }
         g_vars = nv;
         g_var_cap = cap;
     }
     e = &g_vars[g_var_n++];
     e->dap_ref = g_next_ref++;
     e->ptr = ptr;
+    e->owner = L;
     lua_pushvalue(L, idx);
     e->reg_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    return e->dap_ref;
+    dap_ref = e->dap_ref;
+    dap_mutex_unlock();
+    return dap_ref;
 }
 
 static int push_ref_table(lua_State *L, int dap_ref) {
     size_t i;
+    int ok = 0;
+
+    dap_mutex_init();
+    dap_mutex_lock();
     for (i = 0; i < g_var_n; i++) {
         if (g_vars[i].dap_ref == dap_ref) {
+            if (g_vars[i].owner != L)
+                break;
             lua_rawgeti(L, LUA_REGISTRYINDEX, g_vars[i].reg_ref);
-            return lua_istable(L, -1);
+            ok = lua_istable(L, -1);
+            break;
         }
     }
-    return 0;
+    dap_mutex_unlock();
+    return ok;
 }
 
 /* Lua 5.4 string.format("%q")-style quoting. */
@@ -456,7 +545,7 @@ static cJSON *format_var(lua_State *L, const char *name, int idx,
     return o;
 }
 
-cJSON *lua_debug_stack_frames(lua_State *L) {
+cJSON *lua_debug_stack_frames(lua_State *L, int thread_id) {
     user_frame frames[MAX_USER_FRAMES];
     int n = walk_user_frames(L, frames);
     cJSON *body = cJSON_CreateObject();
@@ -480,7 +569,8 @@ cJSON *lua_debug_stack_frames(lua_State *L) {
         fr = cJSON_CreateObject();
         if (fr) {
             cJSON *src = cJSON_CreateObject();
-            cJSON_AddNumberToObject(fr, "id", i);
+            cJSON_AddNumberToObject(fr, "id",
+                                    lua_debug_pack_frame_id(thread_id, i));
             cJSON_AddStringToObject(fr, "name", ar.name ? ar.name : "?");
             cJSON_AddNumberToObject(fr, "line",
                                     ar.currentline > 0 ? ar.currentline : 0);
@@ -507,10 +597,11 @@ static cJSON *collect_locals(lua_State *L, int frame_id) {
     cJSON *arr = cJSON_CreateArray();
     lua_Debug ar;
     int i;
+    int index = lua_debug_unpack_frame_index(frame_id);
 
     if (!arr) return NULL;
-    if (frame_id < 0 || frame_id >= n) return arr;
-    if (!lua_getstack(L, frames[frame_id].level, &ar)) return arr;
+    if (index < 0 || index >= n) return arr;
+    if (!lua_getstack(L, frames[index].level, &ar)) return arr;
     for (i = 1;; i++) {
         const char *name = lua_getlocal(L, &ar, i);
         if (!name) break;
@@ -529,10 +620,11 @@ static cJSON *collect_upvalues(lua_State *L, int frame_id) {
     cJSON *arr = cJSON_CreateArray();
     lua_Debug ar;
     int i;
+    int index = lua_debug_unpack_frame_index(frame_id);
 
     if (!arr) return NULL;
-    if (frame_id < 0 || frame_id >= n) return arr;
-    if (!lua_getstack(L, frames[frame_id].level, &ar)) return arr;
+    if (index < 0 || index >= n) return arr;
+    if (!lua_getstack(L, frames[index].level, &ar)) return arr;
     if (!lua_getinfo(L, "f", &ar)) return arr;
     for (i = 1;; i++) {
         const char *name = lua_getupvalue(L, -1, i);
@@ -695,6 +787,7 @@ cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
     is_repl = context && strcmp(context, "repl") == 0;
 
     n = walk_user_frames(L, frames);
+    frame_id = lua_debug_unpack_frame_index(frame_id);
     if (frame_id < 0 || frame_id >= n)
         return eval_fail(err, "invalid frameId");
 
@@ -748,7 +841,12 @@ cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
 }
 
 static void pause_loop(lua_State *L, const char *reason) {
-    int tid = coro_registry_id_for(L);
+    int tid;
+
+    dap_mutex_init();
+    dap_mutex_lock();
+    tid = coro_registry_id_for(L);
+    dap_mutex_unlock();
     if (tid <= 0)
         tid = 1;
     if (dap_session_pause_enter(L, tid, reason) != 0) {
@@ -772,15 +870,18 @@ static void on_line_hook(lua_State *L, lua_Debug *ar) {
     char *path = NULL;
     int line = 0;
     int level = 0;
+    char *cond = NULL;
 
     (void)ar;
     if (dap_session_is_dead() || !dap_session_client_open())
         return;
     if (!find_user_line(L, &path, &line, &level))
         return;
-    if (dap_session_bp_should_stop(path, line)) {
-        const char *cond = dap_session_bp_condition(path, line);
-        if (eval_breakpoint_condition(L, level, cond)) {
+    if (dap_session_bp_snapshot(path, line, &cond)) {
+        int hit = eval_breakpoint_condition(L, level, cond);
+        free(cond);
+        cond = NULL;
+        if (hit) {
             free(path);
             pause_loop(L, "breakpoint");
             return;

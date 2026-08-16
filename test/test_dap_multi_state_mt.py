@@ -46,10 +46,45 @@ def wait_cmd(c, command, limit=40):
     )
 
 
+def inspect_paused(c, thread_id, expect_name, expect_value):
+    """stackTrace + scopes + variables (no threadId on variables, VS Code style)."""
+    c.send_request("stackTrace", {"threadId": thread_id})
+    st = wait_cmd(c, "stackTrace")
+    assert st.get("success") is True, st
+    frames = (st.get("body") or {}).get("stackFrames") or []
+    assert frames, st
+    frame_id = frames[0]["id"]
+    c.send_request("scopes", {"frameId": frame_id})
+    sc = wait_cmd(c, "scopes")
+    assert sc.get("success") is True, sc
+    scopes = (sc.get("body") or {}).get("scopes") or []
+    assert scopes, sc
+    locals_ref = scopes[0].get("variablesReference")
+    c.send_request("variables", {"variablesReference": locals_ref})
+    vr = wait_cmd(c, "variables")
+    assert vr.get("success") is True, vr
+    variables = (vr.get("body") or {}).get("variables") or []
+    names = {v.get("name"): v for v in variables}
+    assert expect_name in names, variables
+    got = names[expect_name].get("value")
+    assert str(got) == str(expect_value), (expect_name, got, expect_value)
+    if "t" in names:
+        tref = names["t"].get("variablesReference") or 0
+        if tref:
+            c.send_request("variables", {"variablesReference": tref})
+            nested = wait_cmd(c, "variables")
+            assert nested.get("success") is True, nested
+            nvars = (nested.get("body") or {}).get("variables") or []
+            nnames = {v.get("name"): v for v in nvars}
+            assert "v" in nnames, nvars
+            assert str(nnames["v"].get("value")) == str(expect_value), nnames["v"]
+    return names
+
+
 def main():
     host = find_host()
-    line_a = bp_line(SCRIPT_A, "local x = 1")
-    line_b = bp_line(SCRIPT_B, "local y = 2")
+    line_a = bp_line(SCRIPT_A, "return x")
+    line_b = bp_line(SCRIPT_B, "return y")
     src_a = str(SCRIPT_A).replace("\\", "/")
     src_b = str(SCRIPT_B).replace("\\", "/")
     try:
@@ -114,6 +149,8 @@ def main():
             h2,
         )
 
+        inspect_paused(c, logic["id"], "x", "1")
+
         c.send_request(
             "setBreakpoints",
             {"source": {"path": src_b}, "breakpoints": [{"line": line_b}]},
@@ -133,6 +170,9 @@ def main():
         resp2 = wait_cmd(c, "threads")
         names = [t.get("name") for t in ((resp2.get("body") or {}).get("threads") or [])]
         assert "logic" in names and "ui" in names, resp2
+
+        inspect_paused(c, logic["id"], "x", "1")
+        inspect_paused(c, ui["id"], "y", "2")
 
         c.send_request("continue", {"threadId": logic["id"]})
         cont_a = wait_cmd(c, "continue")

@@ -74,6 +74,7 @@ enum { DAP_REQ_Q_MAX = 64 };
 
 typedef struct {
     cJSON *msg;
+    int target_tid; /* 0 = unbound; owner-thread drain uses this */
 } dap_queued_req;
 
 typedef struct {
@@ -449,6 +450,43 @@ static int msg_thread_id(cJSON *msg) {
     return 0;
 }
 
+static int msg_frame_id(cJSON *msg) {
+    cJSON *args = msg ? cJSON_GetObjectItemCaseSensitive(msg, "arguments") : NULL;
+    cJSON *fj = args ? cJSON_GetObjectItemCaseSensitive(args, "frameId") : NULL;
+    if (fj && cJSON_IsNumber(fj))
+        return (int)fj->valuedouble;
+    return -1;
+}
+
+static int msg_var_ref(cJSON *msg) {
+    cJSON *args = msg ? cJSON_GetObjectItemCaseSensitive(msg, "arguments") : NULL;
+    cJSON *rj = args ? cJSON_GetObjectItemCaseSensitive(args, "variablesReference")
+                     : NULL;
+    if (rj && cJSON_IsNumber(rj))
+        return (int)rj->valuedouble;
+    return 0;
+}
+
+static int infer_req_tid(cJSON *msg) {
+    int tid;
+    const char *cmd;
+
+    tid = msg_thread_id(msg);
+    if (tid > 0) return tid;
+    cmd = msg_command(msg);
+    if (!cmd) return 0;
+    if (strcmp(cmd, "variables") == 0)
+        return lua_debug_tid_from_varref(msg_var_ref(msg));
+    if (strcmp(cmd, "evaluate") == 0 || strcmp(cmd, "scopes") == 0 ||
+        strcmp(cmd, "stackTrace") == 0) {
+        int fid = msg_frame_id(msg);
+        if (fid >= 0)
+            return lua_debug_unpack_frame_tid(fid);
+        return 0;
+    }
+    return 0;
+}
+
 /* Owner-thread only. Do not call on another state's L. */
 static lua_State *owner_main_of(lua_State *L) {
 #if LUA_VERSION_NUM >= 502
@@ -491,17 +529,22 @@ static int cmd_needs_lua(const char *cmd) {
            strcmp(cmd, "variables") == 0 || strcmp(cmd, "evaluate") == 0;
 }
 
-static int lua_req_ready_for(lua_State *self_L, cJSON *msg) {
-    int tid = msg_thread_id(msg);
+static int lua_req_ready_for(lua_State *self_L, const dap_queued_req *q) {
+    int tid;
     dap_paused_entry *e;
 
+    if (!q || !q->msg) return 0;
+    tid = q->target_tid > 0 ? q->target_tid : infer_req_tid(q->msg);
     if (tid > 0) {
         e = paused_find(tid);
         if (!e) return 1; /* empty / error path; no Lua walk */
         return L_related(self_L, e->L, e->mainL);
     }
     if (g_paused_n == 0) return 1;
-    return paused_related_to(self_L) != NULL;
+    /* Unbound inspect: only the unique paused updater may drain it. */
+    if (g_paused_n == 1)
+        return paused_related_to(self_L) != NULL;
+    return 0;
 }
 
 static void queue_clear(int reply) {
@@ -512,6 +555,7 @@ static void queue_clear(int reply) {
             send_response(g_q[i].msg, NULL, 0, "disconnected");
         cJSON_Delete(g_q[i].msg);
         g_q[i].msg = NULL;
+        g_q[i].target_tid = 0;
     }
     g_q_n = 0;
 }
@@ -526,10 +570,11 @@ static void enqueue_req(cJSON *msg) {
         cJSON_Delete(msg);
         return;
     }
+    tid = infer_req_tid(msg);
     g_q[g_q_n].msg = msg;
+    g_q[g_q_n].target_tid = tid;
     g_q_n++;
 
-    tid = msg_thread_id(msg);
     if (tid > 0) {
         dap_paused_entry *e = paused_find(tid);
         if (e) dap_cond_signal(&e->cond);
@@ -545,8 +590,8 @@ static void drain_lua_reqs_for(lua_State *self_L) {
     int i = 0;
 
     while (i < g_q_n) {
-        cJSON *msg = g_q[i].msg;
-        if (!lua_req_ready_for(self_L, msg)) {
+        dap_queued_req q = g_q[i];
+        if (!lua_req_ready_for(self_L, &q)) {
             i++;
             continue;
         }
@@ -555,8 +600,9 @@ static void drain_lua_reqs_for(lua_State *self_L) {
                     (size_t)(g_q_n - i - 1) * sizeof(g_q[0]));
         g_q_n--;
         g_q[g_q_n].msg = NULL;
-        dispatch(self_L, msg);
-        cJSON_Delete(msg);
+        g_q[g_q_n].target_tid = 0;
+        dispatch(self_L, q.msg);
+        cJSON_Delete(q.msg);
         if (g_sess.dead || !g_sess.client_open) break;
     }
 }
@@ -768,7 +814,7 @@ static void handle_stack_trace(lua_State *L, cJSON *req) {
     }
     walk_L = e->L;
     dap_mutex_unlock();
-    body = lua_debug_stack_frames(walk_L);
+    body = lua_debug_stack_frames(walk_L, tid);
     dap_mutex_lock();
     send_response(req, body, 1, NULL);
 }
@@ -803,15 +849,37 @@ static void handle_scopes(cJSON *req) {
     send_response(req, body, 1, NULL);
 }
 
+static dap_paused_entry *paused_for_inspect(lua_State *self_L, int tid) {
+    dap_paused_entry *pe;
+
+    if (tid > 0) {
+        pe = paused_find(tid);
+        if (pe && L_related(self_L, pe->L, pe->mainL))
+            return pe;
+        return NULL;
+    }
+    if (g_paused_n == 1) {
+        pe = paused_related_to(self_L);
+        if (pe && L_related(self_L, pe->L, pe->mainL))
+            return pe;
+    }
+    return NULL;
+}
+
 static void handle_variables(lua_State *L, cJSON *req) {
     cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
     cJSON *refj = args ? cJSON_GetObjectItemCaseSensitive(args, "variablesReference")
                        : NULL;
     int ref = (refj && cJSON_IsNumber(refj)) ? (int)refj->valuedouble : 0;
     int tid = msg_thread_id(req);
-    dap_paused_entry *pe = tid > 0 ? paused_find(tid) : paused_related_to(L);
-    lua_State *target = (pe && L_related(L, pe->L, pe->mainL)) ? pe->L : NULL;
+    dap_paused_entry *pe;
+    lua_State *target;
     cJSON *body;
+
+    if (tid <= 0)
+        tid = lua_debug_tid_from_varref(ref);
+    pe = paused_for_inspect(L, tid);
+    target = pe ? pe->L : NULL;
 
     if (!target) {
         body = cJSON_CreateObject();
@@ -839,19 +907,21 @@ static void handle_evaluate(lua_State *L, cJSON *req) {
                           : "watch";
     char *err = NULL;
     cJSON *body;
+    int tid = msg_thread_id(req);
+    dap_paused_entry *pe;
+    lua_State *target;
 
-    {
-        int tid = msg_thread_id(req);
-        dap_paused_entry *pe = tid > 0 ? paused_find(tid) : paused_related_to(L);
-        lua_State *target = (pe && L_related(L, pe->L, pe->mainL)) ? pe->L : NULL;
-        if (!target) {
-            send_response(req, NULL, 0, "not paused");
-            return;
-        }
-        dap_mutex_unlock();
-        body = lua_debug_evaluate(target, expr, frame_id, ctx, &err);
-        dap_mutex_lock();
+    if (tid <= 0)
+        tid = lua_debug_unpack_frame_tid(frame_id);
+    pe = paused_for_inspect(L, tid);
+    target = pe ? pe->L : NULL;
+    if (!target) {
+        send_response(req, NULL, 0, "not paused");
+        return;
     }
+    dap_mutex_unlock();
+    body = lua_debug_evaluate(target, expr, frame_id, ctx, &err);
+    dap_mutex_lock();
     if (!body) {
         send_response(req, NULL, 0, err ? err : "evaluate failed");
         free(err);
@@ -920,13 +990,34 @@ static void dispatch(lua_State *L, cJSON *msg) {
     }
 }
 
-int dap_session_is_dead(void) { return g_sess.dead; }
+int dap_session_is_dead(void) {
+    int d;
+    dap_mutex_init();
+    dap_mutex_lock();
+    d = g_sess.dead;
+    dap_mutex_unlock();
+    return d;
+}
 
-int dap_session_client_open(void) { return g_sess.client_open; }
+int dap_session_client_open(void) {
+    int o;
+    dap_mutex_init();
+    dap_mutex_lock();
+    o = g_sess.client_open;
+    dap_mutex_unlock();
+    return o;
+}
 
 int dap_session_hooks_active(void) { return g_sess.hook_installed && !g_sess.dead; }
 
-int dap_session_is_paused(void) { return g_paused_n > 0; }
+int dap_session_is_paused(void) {
+    int n;
+    dap_mutex_init();
+    dap_mutex_lock();
+    n = g_paused_n;
+    dap_mutex_unlock();
+    return n > 0;
+}
 
 int dap_session_paused_contains(int thread_id) {
     int found;
@@ -952,9 +1043,9 @@ int dap_session_pause_enter(lua_State *L, int thread_id, const char *reason) {
     lua_State *mainL = owner_main_of(L);
     dap_paused_entry *e;
 
-    dap_session_reset_var_maps(L);
     dap_mutex_init();
     dap_mutex_lock();
+    dap_session_reset_var_maps(L);
     if (paused_add(L, thread_id) != 0) {
         dap_mutex_unlock();
         return -1;
@@ -1066,13 +1157,21 @@ static const dap_bp *bp_at(const char *norm_path, int line) {
     return NULL;
 }
 
-int dap_session_bp_should_stop(const char *norm_path, int line) {
-    return bp_at(norm_path, line) != NULL;
-}
+int dap_session_bp_snapshot(const char *norm_path, int line, char **cond_out) {
+    const dap_bp *bp;
+    int hit = 0;
 
-const char *dap_session_bp_condition(const char *norm_path, int line) {
-    const dap_bp *bp = bp_at(norm_path, line);
-    return bp ? bp->condition : NULL;
+    if (cond_out) *cond_out = NULL;
+    dap_mutex_init();
+    dap_mutex_lock();
+    bp = bp_at(norm_path, line);
+    if (bp) {
+        hit = 1;
+        if (cond_out && bp->condition && bp->condition[0])
+            *cond_out = trim_dup(bp->condition);
+    }
+    dap_mutex_unlock();
+    return hit;
 }
 
 /* End the current DAP *client* session but keep the TCP listen socket so a
@@ -1107,12 +1206,9 @@ static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req) {
     g_sess.client_open = 0;
     g_sess.seq = 0;
 
-    {
-        int si, sn = state_registry_count();
-        for (si = 0; si < sn; si++)
-            lua_debug_clear_hook(state_registry_main_at(si));
-    }
-    coro_registry_clear_hooks_all();
+    /* Disarm globally; each owner clears its own hook on update/pause_loop. */
+    lua_debug_clear_hook(L);
+    coro_registry_clear_hooks_owned(L);
     lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
     dap_recv_buf_free(&g_sess.recv_buf);
@@ -1157,12 +1253,9 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     }
 
     {
-        int si, sn = state_registry_count();
-        for (si = 0; si < sn; si++) {
-            lua_State *m = state_registry_main_at(si);
-            lua_debug_clear_hook(m);
-            coro_registry_uninstall_wrappers(m);
-        }
+        lua_debug_clear_hook(L);
+        coro_registry_clear_hooks_owned(L);
+        coro_registry_uninstall_wrappers(L);
     }
     lua_debug_reset_var_maps(L);
     g_sess.hook_installed = 0;
@@ -1252,11 +1345,16 @@ int dap_session_update(lua_State *L) {
         g_sess.close_pending = 0;
         if (!g_sess.dead)
             dap_session_reset_client(L, NULL);
-    } else if (g_sess.configured && !g_sess.hook_installed && g_sess.client_open &&
-               !g_sess.dead) {
-        lua_debug_install_hook(L);
+    }
+    if (g_sess.configured && g_sess.client_open && !g_sess.dead) {
         g_sess.hook_installed = 1;
-        coro_registry_install_hooks_all();
+        lua_debug_install_hook(L);
+        coro_registry_install_hooks_owned(L);
+    } else {
+        lua_debug_clear_hook(L);
+        coro_registry_clear_hooks_owned(L);
+        if (!g_sess.client_open || g_sess.dead)
+            g_sess.hook_installed = 0;
     }
     if (!g_sess.dead)
         coro_registry_purge_dead(L);
@@ -1266,22 +1364,33 @@ out:
     return rc;
 }
 
+static int session_wait_done(void) {
+    int done;
+    dap_mutex_init();
+    dap_mutex_lock();
+    done = g_sess.configured || g_sess.dead;
+    dap_mutex_unlock();
+    return done;
+}
+
 static void start_wait_configured(lua_State *L) {
-    while (!g_sess.configured && !g_sess.dead) {
+    /* Caller must not hold session_mutex: update() takes it, and POSIX mutex
+     * is non-recursive. Do not sleep while the lock is held. */
+    while (!session_wait_done()) {
         if (dap_session_update(L) != 0) {
             dap_session_shutdown(L, NULL);
             break;
         }
         short_sleep();
     }
-    /* Host thread after wait: same thread that will run debugee code. */
-    if (g_sess.client_open && !g_sess.dead && !g_sess.hook_installed) {
-        lua_debug_install_hook(L);
+    dap_mutex_init();
+    dap_mutex_lock();
+    if (g_sess.client_open && !g_sess.dead) {
         g_sess.hook_installed = 1;
-        coro_registry_install_hooks_all();
-    } else if (g_sess.client_open && !g_sess.dead && g_sess.hook_installed) {
         lua_debug_install_hook(L);
+        coro_registry_install_hooks_owned(L);
     }
+    dap_mutex_unlock();
 }
 
 static int start_join_state(lua_State *L, const char *name) {
@@ -1302,6 +1411,7 @@ int dap_session_start_ex(lua_State *L, const char *host, int port, int wait,
                          const char *name) {
     char err[256];
     int rc = 0;
+    int holding = 1;
 
     if (!host) host = "";
     if (name && !name[0]) name = NULL;
@@ -1318,8 +1428,11 @@ int dap_session_start_ex(lua_State *L, const char *host, int port, int wait,
             rc = -1;
             goto out;
         }
-        if (wait)
+        if (wait) {
+            dap_mutex_unlock();
+            holding = 0;
             start_wait_configured(L);
+        }
         goto out;
     }
 
@@ -1354,14 +1467,18 @@ int dap_session_start_ex(lua_State *L, const char *host, int port, int wait,
         rc = -1;
         goto out;
     }
-    coro_registry_clear(L);
+    coro_registry_reset();
     coro_registry_track(L, L, name ? name : "main");
     coro_registry_install_wrappers(L);
 
-    if (wait)
+    if (wait) {
+        dap_mutex_unlock();
+        holding = 0;
         start_wait_configured(L);
+    }
 
 out:
-    dap_mutex_unlock();
+    if (holding)
+        dap_mutex_unlock();
     return rc;
 }
