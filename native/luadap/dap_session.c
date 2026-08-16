@@ -45,12 +45,6 @@ struct dap_session {
     int dead;
     int close_pending;
     int hook_installed;
-    int paused;
-    int paused_thread_id;
-    lua_State *paused_L;
-    int step; /* DAP_STEP_* */
-    int step_depth;
-    lua_State *step_L;
     int next_ref;
     int seq;
     dap_recv_buf recv_buf;
@@ -61,7 +55,172 @@ struct dap_session {
 
 static dap_session g_sess;
 
+enum { DAP_PAUSED_MAX = 64 };
+
+typedef struct {
+    int thread_id;
+    lua_State *L;
+    dap_cond cond;
+    int cond_ready;
+    int step_mode; /* DAP_STEP_* (copied to g_steps on step*) */
+    int step_depth;
+} dap_paused_entry;
+
+typedef struct {
+    int thread_id;
+    lua_State *L;
+    int step_mode;
+    int step_depth;
+} dap_step_slot;
+
+static dap_paused_entry g_paused[DAP_PAUSED_MAX];
+static int g_paused_n;
+static dap_step_slot g_steps[DAP_PAUSED_MAX];
+
 static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req);
+static int send_event(const char *event, cJSON *body);
+
+static dap_paused_entry *paused_find(int tid) {
+    int i;
+    if (tid <= 0) return NULL;
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_paused[i].thread_id == tid)
+            return &g_paused[i];
+    }
+    return NULL;
+}
+
+static dap_paused_entry *paused_find_L(lua_State *L) {
+    int i;
+    if (!L) return NULL;
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_paused[i].thread_id != 0 && g_paused[i].L == L)
+            return &g_paused[i];
+    }
+    return NULL;
+}
+
+static dap_paused_entry *first_paused(void) {
+    int i;
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_paused[i].thread_id != 0)
+            return &g_paused[i];
+    }
+    return NULL;
+}
+
+static int paused_add(lua_State *L, int tid) {
+    int i;
+    dap_paused_entry *e;
+
+    if (tid <= 0 || !L) return -1;
+    e = paused_find(tid);
+    if (e) {
+        e->L = L;
+        return 0;
+    }
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_paused[i].thread_id != 0) continue;
+        if (!g_paused[i].cond_ready) {
+            dap_cond_init(&g_paused[i].cond);
+            g_paused[i].cond_ready = 1;
+        }
+        g_paused[i].thread_id = tid;
+        g_paused[i].L = L;
+        g_paused[i].step_mode = DAP_STEP_NONE;
+        g_paused[i].step_depth = 0;
+        g_paused_n++;
+        return 0;
+    }
+    return -1;
+}
+
+static void paused_remove(int tid) {
+    dap_paused_entry *e = paused_find(tid);
+    if (!e) return;
+    dap_cond_signal(&e->cond);
+    e->thread_id = 0;
+    e->L = NULL;
+    e->step_mode = DAP_STEP_NONE;
+    e->step_depth = 0;
+    if (g_paused_n > 0) g_paused_n--;
+}
+
+static void paused_clear_all(void) {
+    int i;
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_paused[i].thread_id != 0)
+            dap_cond_signal(&g_paused[i].cond);
+        g_paused[i].thread_id = 0;
+        g_paused[i].L = NULL;
+        g_paused[i].step_mode = DAP_STEP_NONE;
+        g_paused[i].step_depth = 0;
+    }
+    g_paused_n = 0;
+}
+
+static dap_step_slot *step_find_tid(int tid) {
+    int i;
+    if (tid <= 0) return NULL;
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_steps[i].thread_id == tid)
+            return &g_steps[i];
+    }
+    return NULL;
+}
+
+static dap_step_slot *step_find_L(lua_State *L) {
+    int i;
+    if (!L) return NULL;
+    for (i = 0; i < DAP_PAUSED_MAX; i++) {
+        if (g_steps[i].thread_id != 0 && g_steps[i].L == L)
+            return &g_steps[i];
+    }
+    return NULL;
+}
+
+static void step_set(int tid, lua_State *L, int mode, int depth) {
+    dap_step_slot *s = step_find_tid(tid);
+    int i;
+    if (!s) {
+        for (i = 0; i < DAP_PAUSED_MAX; i++) {
+            if (g_steps[i].thread_id == 0) {
+                s = &g_steps[i];
+                break;
+            }
+        }
+    }
+    if (!s) return;
+    s->thread_id = tid;
+    s->L = L;
+    s->step_mode = mode;
+    s->step_depth = depth;
+}
+
+static void step_clear_tid(int tid) {
+    dap_step_slot *s = step_find_tid(tid);
+    if (!s) return;
+    s->thread_id = 0;
+    s->L = NULL;
+    s->step_mode = DAP_STEP_NONE;
+    s->step_depth = 0;
+}
+
+static void step_clear_all(void) {
+    memset(g_steps, 0, sizeof(g_steps));
+}
+
+static int send_stopped_event(int tid, const char *reason) {
+    cJSON *body = cJSON_CreateObject();
+    if (!body) return -1;
+    if (!cJSON_AddStringToObject(body, "reason", reason ? reason : "breakpoint") ||
+        !cJSON_AddNumberToObject(body, "threadId", (double)tid) ||
+        !cJSON_AddBoolToObject(body, "allThreadsStopped", 0)) {
+        cJSON_Delete(body);
+        return -1;
+    }
+    return send_event("stopped", body);
+}
 
 dap_session *dap_session_get(void) { return &g_sess; }
 
@@ -370,62 +529,71 @@ static void handle_configuration_done(cJSON *req) {
     /* Do not install the hook here: host thread update/wait installs it. */
 }
 
-static lua_State *step_target_L(lua_State *L) {
-    lua_State *pl = dap_session_paused_L();
-    return pl ? pl : L;
-}
+static int resolve_target_tid(cJSON *req, int *out_tid) {
+    cJSON *args = req ? cJSON_GetObjectItemCaseSensitive(req, "arguments") : NULL;
+    cJSON *tj = args ? cJSON_GetObjectItemCaseSensitive(args, "threadId") : NULL;
+    dap_paused_entry *e;
 
-static void clear_paused_thread(void) {
-    g_sess.paused = 0;
-    g_sess.paused_L = NULL;
-    g_sess.paused_thread_id = 0;
+    if (tj && cJSON_IsNumber(tj)) {
+        *out_tid = (int)tj->valuedouble;
+        return 0;
+    }
+    if (g_paused_n == 1) {
+        e = first_paused();
+        if (!e) return -1;
+        *out_tid = e->thread_id;
+        return 0;
+    }
+    return -1;
 }
 
 static void handle_continue(cJSON *req) {
-    cJSON *args = cJSON_GetObjectItemCaseSensitive(req, "arguments");
-    cJSON *tidj = args ? cJSON_GetObjectItemCaseSensitive(args, "threadId") : NULL;
+    int tid;
     cJSON *body;
 
-    if (tidj && cJSON_IsNumber(tidj) &&
-        (int)tidj->valuedouble != dap_session_paused_thread_id()) {
+    if (resolve_target_tid(req, &tid) != 0 || !paused_find(tid)) {
         send_response(req, NULL, 0, "thread not paused");
         return;
     }
+    step_clear_tid(tid);
+    paused_remove(tid);
     body = cJSON_CreateObject();
-    g_sess.step = DAP_STEP_NONE;
-    g_sess.step_depth = 0;
-    g_sess.step_L = NULL;
-    clear_paused_thread();
     if (body)
-        cJSON_AddBoolToObject(body, "allThreadsContinued", 1);
+        cJSON_AddBoolToObject(body, "allThreadsContinued", 0);
     send_response(req, body, 1, NULL);
 }
 
-static void handle_next(lua_State *L, cJSON *req) {
-    lua_State *target = step_target_L(L);
-    g_sess.step = DAP_STEP_OVER;
-    g_sess.step_depth = lua_debug_current_depth(target);
-    g_sess.step_L = target;
-    clear_paused_thread();
+static void handle_step_cmd(lua_State *L, cJSON *req, int mode) {
+    int tid;
+    dap_paused_entry *e;
+    lua_State *target;
+
+    (void)L;
+    if (resolve_target_tid(req, &tid) != 0) {
+        send_response(req, NULL, 0, "thread not paused");
+        return;
+    }
+    e = paused_find(tid);
+    if (!e) {
+        send_response(req, NULL, 0, "thread not paused");
+        return;
+    }
+    target = e->L;
+    step_set(tid, target, mode, lua_debug_current_depth(target));
+    paused_remove(tid);
     send_response(req, cJSON_CreateObject(), 1, NULL);
+}
+
+static void handle_next(lua_State *L, cJSON *req) {
+    handle_step_cmd(L, req, DAP_STEP_OVER);
 }
 
 static void handle_step_in(lua_State *L, cJSON *req) {
-    lua_State *target = step_target_L(L);
-    g_sess.step = DAP_STEP_IN;
-    g_sess.step_depth = lua_debug_current_depth(target);
-    g_sess.step_L = target;
-    clear_paused_thread();
-    send_response(req, cJSON_CreateObject(), 1, NULL);
+    handle_step_cmd(L, req, DAP_STEP_IN);
 }
 
 static void handle_step_out(lua_State *L, cJSON *req) {
-    lua_State *target = step_target_L(L);
-    g_sess.step = DAP_STEP_OUT;
-    g_sess.step_depth = lua_debug_current_depth(target);
-    g_sess.step_L = target;
-    clear_paused_thread();
-    send_response(req, cJSON_CreateObject(), 1, NULL);
+    handle_step_cmd(L, req, DAP_STEP_OUT);
 }
 
 static void handle_stack_trace(lua_State *L, cJSON *req) {
@@ -433,6 +601,7 @@ static void handle_stack_trace(lua_State *L, cJSON *req) {
     cJSON *tidj = args ? cJSON_GetObjectItemCaseSensitive(args, "threadId") : NULL;
     int tid = (tidj && cJSON_IsNumber(tidj)) ? (int)tidj->valuedouble : 1;
     lua_State *target = coro_registry_state_for(tid);
+    dap_paused_entry *e;
     cJSON *body;
 
     (void)L;
@@ -440,7 +609,8 @@ static void handle_stack_trace(lua_State *L, cJSON *req) {
         send_response(req, NULL, 0, "unknown thread");
         return;
     }
-    if (!dap_session_is_paused() || tid != dap_session_paused_thread_id()) {
+    e = paused_find(tid);
+    if (!e) {
         body = cJSON_CreateObject();
         if (body) {
             cJSON_AddArrayToObject(body, "stackFrames");
@@ -449,7 +619,7 @@ static void handle_stack_trace(lua_State *L, cJSON *req) {
         send_response(req, body, 1, NULL);
         return;
     }
-    send_response(req, lua_debug_stack_frames(dap_session_paused_L()), 1, NULL);
+    send_response(req, lua_debug_stack_frames(e->L), 1, NULL);
 }
 
 static void handle_scopes(cJSON *req) {
@@ -487,9 +657,8 @@ static void handle_variables(lua_State *L, cJSON *req) {
     cJSON *refj = args ? cJSON_GetObjectItemCaseSensitive(args, "variablesReference")
                        : NULL;
     int ref = (refj && cJSON_IsNumber(refj)) ? (int)refj->valuedouble : 0;
-    lua_State *target = (dap_session_is_paused() && dap_session_paused_L())
-                            ? dap_session_paused_L()
-                            : L;
+    dap_paused_entry *pe = first_paused();
+    lua_State *target = (pe && pe->L) ? pe->L : L;
     send_response(req, lua_debug_collect_variables(target, ref), 1, NULL);
 }
 
@@ -508,11 +677,14 @@ static void handle_evaluate(cJSON *req) {
     char *err = NULL;
     cJSON *body;
 
-    if (!dap_session_is_paused() || !dap_session_paused_L()) {
-        send_response(req, NULL, 0, "not paused");
-        return;
+    {
+        dap_paused_entry *pe = first_paused();
+        if (!pe || !pe->L) {
+            send_response(req, NULL, 0, "not paused");
+            return;
+        }
+        body = lua_debug_evaluate(pe->L, expr, frame_id, ctx, &err);
     }
-    body = lua_debug_evaluate(dap_session_paused_L(), expr, frame_id, ctx, &err);
     if (!body) {
         send_response(req, NULL, 0, err ? err : "evaluate failed");
         free(err);
@@ -587,31 +759,116 @@ int dap_session_client_open(void) { return g_sess.client_open; }
 
 int dap_session_hooks_active(void) { return g_sess.hook_installed && !g_sess.dead; }
 
-int dap_session_is_paused(void) { return g_sess.paused; }
+int dap_session_is_paused(void) { return g_paused_n > 0; }
 
-void dap_session_set_paused(int paused) { g_sess.paused = paused ? 1 : 0; }
-
-void dap_session_set_paused_thread(lua_State *L, int thread_id) {
-    g_sess.paused_L = L;
-    g_sess.paused_thread_id = thread_id > 0 ? thread_id : 1;
+int dap_session_paused_contains(int thread_id) {
+    int found;
+    dap_mutex_init();
+    dap_mutex_lock();
+    found = paused_find(thread_id) != NULL;
+    dap_mutex_unlock();
+    return found;
 }
 
-int dap_session_paused_thread_id(void) {
-    return g_sess.paused_thread_id > 0 ? g_sess.paused_thread_id : 1;
+int dap_session_is_L_paused(lua_State *L) {
+    int found;
+    dap_mutex_init();
+    dap_mutex_lock();
+    found = paused_find_L(L) != NULL;
+    dap_mutex_unlock();
+    return found;
 }
 
-lua_State *dap_session_paused_L(void) { return g_sess.paused_L; }
+int dap_session_pause_enter(lua_State *L, int thread_id, const char *reason) {
+    int rc;
 
-int dap_session_step_mode(void) { return g_sess.step; }
+    dap_session_reset_var_maps(L);
+    dap_mutex_init();
+    dap_mutex_lock();
+    if (paused_add(L, thread_id) != 0) {
+        dap_mutex_unlock();
+        return -1;
+    }
+    rc = send_stopped_event(thread_id, reason);
+    dap_mutex_unlock();
+    return rc;
+}
 
-int dap_session_step_depth(void) { return g_sess.step_depth; }
+void dap_session_pause_wait_idle(int thread_id) {
+    dap_paused_entry *e;
 
-lua_State *dap_session_step_L(void) { return g_sess.step_L; }
+    dap_mutex_init();
+    dap_mutex_lock();
+    e = paused_find(thread_id);
+    if (e)
+        dap_cond_timedwait(&e->cond, 1);
+    dap_mutex_unlock();
+}
 
-void dap_session_clear_step(void) {
-    g_sess.step = DAP_STEP_NONE;
-    g_sess.step_depth = 0;
-    g_sess.step_L = NULL;
+void dap_session_pause_wait(int thread_id) { dap_session_pause_wait_idle(thread_id); }
+
+int dap_session_resume_thread(int thread_id) {
+    int rc = -1;
+
+    dap_mutex_init();
+    dap_mutex_lock();
+    if (paused_find(thread_id)) {
+        paused_remove(thread_id);
+        rc = 0;
+    }
+    dap_mutex_unlock();
+    return rc;
+}
+
+lua_State *dap_session_paused_L_for(int thread_id) {
+    dap_paused_entry *e;
+    lua_State *L = NULL;
+
+    dap_mutex_init();
+    dap_mutex_lock();
+    e = paused_find(thread_id);
+    if (e) L = e->L;
+    dap_mutex_unlock();
+    return L;
+}
+
+int dap_session_step_mode_of(lua_State *L) {
+    dap_step_slot *s;
+    int mode = DAP_STEP_NONE;
+
+    dap_mutex_init();
+    dap_mutex_lock();
+    s = step_find_L(L);
+    if (s) mode = s->step_mode;
+    dap_mutex_unlock();
+    return mode;
+}
+
+int dap_session_step_depth_of(lua_State *L) {
+    dap_step_slot *s;
+    int depth = 0;
+
+    dap_mutex_init();
+    dap_mutex_lock();
+    s = step_find_L(L);
+    if (s) depth = s->step_depth;
+    dap_mutex_unlock();
+    return depth;
+}
+
+void dap_session_clear_step_of(lua_State *L) {
+    dap_step_slot *s;
+
+    dap_mutex_init();
+    dap_mutex_lock();
+    s = step_find_L(L);
+    if (s) {
+        s->thread_id = 0;
+        s->L = NULL;
+        s->step_mode = DAP_STEP_NONE;
+        s->step_depth = 0;
+    }
+    dap_mutex_unlock();
 }
 
 void dap_session_reset_var_maps(lua_State *L) {
@@ -643,19 +900,6 @@ const char *dap_session_bp_condition(const char *norm_path, int line) {
     return bp ? bp->condition : NULL;
 }
 
-int dap_session_send_stopped(const char *reason) {
-    cJSON *body = cJSON_CreateObject();
-    if (!body) return -1;
-    if (!cJSON_AddStringToObject(body, "reason", reason ? reason : "breakpoint") ||
-        !cJSON_AddNumberToObject(body, "threadId",
-                                 (double)dap_session_paused_thread_id()) ||
-        !cJSON_AddBoolToObject(body, "allThreadsStopped", 0)) {
-        cJSON_Delete(body);
-        return -1;
-    }
-    return send_event("stopped", body);
-}
-
 /* End the current DAP *client* session but keep the TCP listen socket so a
  * long-running host (start(..., false) + update loop) can accept F5 again.
  * - If handshake never completed: set configured=1 so start(wait=true) returns.
@@ -682,10 +926,8 @@ static void dap_session_reset_client(lua_State *L, cJSON *disconnect_req) {
     }
 
     g_sess.close_pending = 0;
-    clear_paused_thread();
-    g_sess.step = DAP_STEP_NONE;
-    g_sess.step_depth = 0;
-    g_sess.step_L = NULL;
+    paused_clear_all();
+    step_clear_all();
     g_sess.client_open = 0;
     g_sess.seq = 0;
 
@@ -710,16 +952,15 @@ void dap_session_shutdown(lua_State *L, cJSON *disconnect_req) {
     size_t n = 0;
 
     if (g_sess.dead) {
-        clear_paused_thread();
+        paused_clear_all();
+        step_clear_all();
         g_sess.configured = 1;
         return;
     }
     g_sess.dead = 1;
     g_sess.close_pending = 0;
-    clear_paused_thread();
-    g_sess.step = DAP_STEP_NONE;
-    g_sess.step_depth = 0;
-    g_sess.step_L = NULL;
+    paused_clear_all();
+    step_clear_all();
     g_sess.configured = 1;
 
     /* Gold: reply + terminated while the client is still marked open, then
@@ -841,6 +1082,8 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
     bp_clear_all();
     dap_recv_buf_free(&g_sess.recv_buf);
     memset(&g_sess, 0, sizeof(g_sess));
+    paused_clear_all();
+    step_clear_all();
     dap_recv_buf_init(&g_sess.recv_buf);
     g_sess.next_ref = 1000;
     g_sess.dap_conn_id = 0;

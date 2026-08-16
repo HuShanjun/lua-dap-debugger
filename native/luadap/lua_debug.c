@@ -8,17 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <windows.h>
-static void short_sleep(void) { Sleep(1); }
-#else
-#include <time.h>
-static void short_sleep(void) {
-    struct timespec ts = {0, 1000000L};
-    nanosleep(&ts, NULL);
-}
-#endif
-
 #define MAX_USER_FRAMES 64
 #define LOCALS_REF_BASE 100000
 #define UPVALS_REF_BASE 200000
@@ -760,23 +749,22 @@ cJSON *lua_debug_evaluate(lua_State *L, const char *expression, int frame_id,
 
 static void pause_loop(lua_State *L, const char *reason) {
     int tid = coro_registry_id_for(L);
-    if (tid == 0)
+    if (tid <= 0)
         tid = 1;
-    dap_session_set_paused_thread(L, tid);
-    dap_session_set_paused(1);
-    dap_session_reset_var_maps(L);
-    if (dap_session_send_stopped(reason) != 0) {
+    if (dap_session_pause_enter(L, tid, reason) != 0) {
         dap_session_shutdown(L, NULL);
         return;
     }
-    while (dap_session_is_paused()) {
+    while (dap_session_paused_contains(tid)) {
         if (dap_session_update(L) != 0) {
             dap_session_shutdown(L, NULL);
             break;
         }
+        if (!dap_session_paused_contains(tid))
+            break;
         if (dap_session_is_dead())
             break;
-        short_sleep();
+        dap_session_pause_wait_idle(tid);
     }
 }
 
@@ -802,26 +790,26 @@ static void on_line_hook(lua_State *L, lua_Debug *ar) {
     free(path);
 
     /* Gold on_line after BP: in → next user line; over when d <= step_depth;
-     * out when d < step_depth. Step is bound to the paused coroutine. */
+     * out when d < step_depth. Step is bound to this L's step slot. */
     {
-        int mode = dap_session_step_mode();
-        if (mode != DAP_STEP_NONE && L != dap_session_step_L())
+        int mode = dap_session_step_mode_of(L);
+        if (mode == DAP_STEP_NONE)
             return;
         if (mode == DAP_STEP_IN) {
-            dap_session_clear_step();
+            dap_session_clear_step_of(L);
             pause_loop(L, "step");
             return;
         }
         if (mode == DAP_STEP_OVER) {
-            if (lua_debug_current_depth(L) <= dap_session_step_depth()) {
-                dap_session_clear_step();
+            if (lua_debug_current_depth(L) <= dap_session_step_depth_of(L)) {
+                dap_session_clear_step_of(L);
                 pause_loop(L, "step");
             }
             return;
         }
         if (mode == DAP_STEP_OUT) {
-            if (lua_debug_current_depth(L) < dap_session_step_depth()) {
-                dap_session_clear_step();
+            if (lua_debug_current_depth(L) < dap_session_step_depth_of(L)) {
+                dap_session_clear_step_of(L);
                 pause_loop(L, "step");
             }
             return;

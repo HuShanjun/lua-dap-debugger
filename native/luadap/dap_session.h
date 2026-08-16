@@ -33,16 +33,17 @@ enum {
 int dap_session_is_dead(void);
 int dap_session_client_open(void);
 int dap_session_hooks_active(void);
-int dap_session_is_paused(void);
-void dap_session_set_paused(int paused);
-void dap_session_set_paused_thread(lua_State *L, int thread_id);
-int dap_session_paused_thread_id(void);
-lua_State *dap_session_paused_L(void);
-int dap_session_step_mode(void);
-int dap_session_step_depth(void);
-lua_State *dap_session_step_L(void);
-void dap_session_clear_step(void);
+int dap_session_is_paused(void); /* any thread in the paused set */
+int dap_session_paused_contains(int thread_id);
+int dap_session_is_L_paused(lua_State *L);
+int dap_session_pause_enter(lua_State *L, int thread_id, const char *reason);
+void dap_session_pause_wait(int thread_id);
+void dap_session_pause_wait_idle(int thread_id);
+int dap_session_resume_thread(int thread_id);
+lua_State *dap_session_paused_L_for(int thread_id);
+int dap_session_step_mode_of(lua_State *L);
+int dap_session_step_depth_of(lua_State *L);
+void dap_session_clear_step_of(lua_State *L);
 void dap_session_reset_var_maps(lua_State *L);
-int dap_session_send_stopped(const char *reason);
 
 #endif

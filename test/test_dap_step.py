@@ -64,8 +64,15 @@ def main():
 
         stopped = c.wait_for(lambda m: m.get("event") == "stopped")
         assert stopped["body"]["reason"] == "breakpoint"
+        assert stopped["body"].get("allThreadsStopped") is False, stopped
         top = stack_top(c)
         assert top["line"] == a_line, top
+
+        c.send_request("next", {"threadId": 999})
+        bad = c.wait_for(
+            lambda m: m.get("command") == "next" and m.get("type") == "response"
+        )
+        assert bad.get("success") is False, bad
 
         c.send_request("next", {"threadId": 1})
         c.wait_for(lambda m: m.get("command") == "next" and m.get("type") == "response")
@@ -91,7 +98,7 @@ def main():
         assert top["line"] == c_line, top
         assert top["name"] == "work", top
 
-        c.send_request("continue", {"threadId": 1})
+        c.send_request("continue", {})
         c.wait_for(lambda m: m.get("command") == "continue" and m.get("type") == "response")
         out, _ = proc.communicate(timeout=5)
         assert "DEBUGEE_DONE" in out, out
