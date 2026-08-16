@@ -10,7 +10,7 @@ if not root then
 end
 
 root = root:gsub("\\", "/")
-package.path = root .. "/script/?.lua;" .. package.path
+package.path = root .. "/sample/script/?.lua;" .. package.path
 package.cpath = root .. "/bin/?.dll;" .. root .. "/bin/Debug/?.dll;" .. package.cpath
 
 local asyncsocket = require("asyncsocket")

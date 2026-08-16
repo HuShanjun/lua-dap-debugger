@@ -10,17 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
-      - name: Cache FetchContent Lua
-        uses: actions/cache@v4
-        with:
-          path: build/_deps
-          key: lua-${{ matrix.lua }}-deps-${{ runner.os }}
       - name: Configure
         # Quote -DLUA_VERSION: Windows pwsh splits 5.4 at the dot.
-        # VS generator matches local build/msvc (Ninja is not on PATH by default).
-        # /3rd is gitignored: no vendored Lua sources on a clean checkout.
-        # LuaSelect FetchContents lua.org tarballs for every matrix version,
-        # including 5.4 when 3rd/lua-5.4.8 is absent.
+        # Vendored trees: 3rd/lua-5.1.5 … 3rd/lua-5.4.8 (required by CMakeLists).
         run: cmake -S . -B build -A x64 "-DLUA_VERSION=${{ matrix.lua }}"
       - name: Build
         run: cmake --build build --config Release --target lua asyncsocket luadap
@@ -51,7 +43,7 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "$pwd/bin;$env:PATH"
-          python script/test/test_asyncsocket_smoke.py
-          python script/test/test_dap_luadap_handshake.py
-          python script/test/test_dap_evaluate.py
-          python script/test/test_dap_condition.py
+          python test/test_asyncsocket_smoke.py
+          python test/test_dap_luadap_handshake.py
+          python test/test_dap_evaluate.py
+          python test/test_dap_condition.py

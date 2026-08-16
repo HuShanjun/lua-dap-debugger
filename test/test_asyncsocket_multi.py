@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 PORT = 18222
 SCRIPT = Path(__file__).resolve().parent / "run_asyncsocket_multi.lua"
 PAYLOADS = (b"alpha", b"bravo")

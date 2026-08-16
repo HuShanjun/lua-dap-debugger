@@ -5,9 +5,9 @@ from pathlib import Path
 
 from dap_client import DapClient
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 PORT = 18290
-DEBUGEE = ROOT / "script" / "test" / "run_debugee_runner.lua"
+DEBUGEE = Path(__file__).resolve().parent / "run_debugee_runner.lua"
 
 
 def find_runner():

@@ -4,8 +4,8 @@ from pathlib import Path
 
 from dap_client import DapClient
 
-ROOT = Path(__file__).resolve().parents[2]
-DEBUGEE = ROOT / "script" / "test" / "run_debugee.lua"
+ROOT = Path(__file__).resolve().parents[1]
+DEBUGEE = Path(__file__).resolve().parent / "run_debugee.lua"
 
 
 def find_lua():

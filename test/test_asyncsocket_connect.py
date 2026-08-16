@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 PORT = 18223
 SCRIPT = Path(__file__).resolve().parent / "run_asyncsocket_connect.lua"
 
