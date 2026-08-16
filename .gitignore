@@ -1,6 +1,6 @@
-/3rd
 /bin
 /build
 /.vscode
 /.superpowers
 **/__pycache__
+/docs
