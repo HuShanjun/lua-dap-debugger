@@ -14,5 +14,8 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN
         _WIN32_WINNT=0x0600
         _CRT_SECURE_NO_WARNINGS)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(multi_state_dap_host PRIVATE Threads::Threads)
 endif()
 set_property(TARGET multi_state_dap_host PROPERTY FOLDER "test")

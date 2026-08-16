@@ -1,6 +1,7 @@
-/* Dual lua_State same-thread DAP host. Loads luadap from bin/ via package.cpath.
+/* Dual lua_State DAP host. Loads luadap from bin/ via package.cpath.
  * args: --port N [--mt] [--mismatch]
- * --mt is reserved (Task 7); this host only pumps both states on one thread. */
+ * default: pump both states on one thread
+ * --mt: two OS threads (A=logic, B=ui); B heartbeats while A may pause */
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -14,6 +15,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -24,12 +26,42 @@
 #define TEST_SCRIPT_DIR "."
 #endif
 
+static volatile long g_heart_b;
+
 static void host_sleep(void) {
 #ifdef _WIN32
     Sleep(10);
 #else
     usleep(10000);
 #endif
+}
+
+static void heart_inc(void) {
+#ifdef _WIN32
+    InterlockedIncrement(&g_heart_b);
+#else
+    __sync_add_and_fetch(&g_heart_b, 1);
+#endif
+}
+
+static long heart_get(void) {
+#ifdef _WIN32
+    return (long)InterlockedCompareExchange(&g_heart_b, 0, 0);
+#else
+    return (long)__sync_add_and_fetch(&g_heart_b, 0);
+#endif
+}
+
+static void emit_heart(void) {
+    FILE *f;
+    long n = heart_get();
+    printf("HEART %ld\n", n);
+    fflush(stdout);
+    f = fopen("ms_heart_b.txt", "w");
+    if (f) {
+        fprintf(f, "%ld\n", n);
+        fclose(f);
+    }
 }
 
 static void slash_copy(char *dst, size_t dstsz, const char *src) {
@@ -103,6 +135,84 @@ static void call_update(lua_State *L) {
     }
 }
 
+typedef struct {
+    lua_State *L;
+    int is_b;
+} pump_arg;
+
+static void pump_once(lua_State *L, int is_b) {
+    call_named(L, "tick");
+    call_update(L);
+    if (is_b)
+        heart_inc();
+}
+
+#ifdef _WIN32
+static DWORD WINAPI pump_thread(LPVOID p) {
+    pump_arg *a = (pump_arg *)p;
+    while (1) {
+        pump_once(a->L, a->is_b);
+        host_sleep();
+    }
+}
+#else
+static void *pump_thread(void *p) {
+    pump_arg *a = (pump_arg *)p;
+    while (1) {
+        pump_once(a->L, a->is_b);
+        host_sleep();
+    }
+}
+#endif
+
+static void run_same_thread(lua_State *L_a, lua_State *L_b) {
+    while (1) {
+        pump_once(L_a, 0);
+        pump_once(L_b, 0);
+        host_sleep();
+    }
+}
+
+static int run_mt(lua_State *L_a, lua_State *L_b) {
+    static pump_arg arg_a;
+    static pump_arg arg_b;
+#ifdef _WIN32
+    HANDLE th_a;
+    HANDLE th_b;
+#else
+    pthread_t th_a;
+    pthread_t th_b;
+#endif
+
+    arg_a.L = L_a;
+    arg_a.is_b = 0;
+    arg_b.L = L_b;
+    arg_b.is_b = 1;
+
+#ifdef _WIN32
+    th_a = CreateThread(NULL, 0, pump_thread, &arg_a, 0, NULL);
+    th_b = CreateThread(NULL, 0, pump_thread, &arg_b, 0, NULL);
+    if (!th_a || !th_b) {
+        fprintf(stderr, "CreateThread failed\n");
+        return 1;
+    }
+    while (1) {
+        emit_heart();
+        Sleep(50);
+    }
+#else
+    if (pthread_create(&th_a, NULL, pump_thread, &arg_a) != 0 ||
+        pthread_create(&th_b, NULL, pump_thread, &arg_b) != 0) {
+        fprintf(stderr, "pthread_create failed\n");
+        return 1;
+    }
+    while (1) {
+        emit_heart();
+        usleep(50000);
+    }
+#endif
+}
+
 static void usage(void) {
     fprintf(stderr, "usage: multi_state_dap_host --port N [--mt] [--mismatch]\n");
 }
@@ -110,6 +220,7 @@ static void usage(void) {
 int main(int argc, char **argv) {
     int port = 18210;
     int mismatch = 0;
+    int mt = 0;
     int i;
     char bin[512];
     char script_dir[512];
@@ -128,8 +239,8 @@ int main(int argc, char **argv) {
             continue;
         }
         if (strcmp(argv[i], "--mt") == 0) {
-            fprintf(stderr, "multi-thread mode not implemented\n");
-            return 1;
+            mt = 1;
+            continue;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage();
@@ -176,11 +287,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    for (;;) {
-        call_named(L_a, "tick");
-        call_update(L_a);
-        call_named(L_b, "tick");
-        call_update(L_b);
-        host_sleep();
-    }
+    if (mt)
+        return run_mt(L_a, L_b);
+    run_same_thread(L_a, L_b);
 }
