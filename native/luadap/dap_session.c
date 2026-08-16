@@ -2,6 +2,7 @@
 #include "coro_registry.h"
 #include "dap_framing.h"
 #include "dap_json.h"
+#include "dap_sync.h"
 #include "lua_debug.h"
 #include "poll_loop.h"
 
@@ -754,8 +755,12 @@ int dap_session_update(lua_State *L) {
     as_event *evs;
     size_t i;
     int k;
+    int rc = 0;
 
-    if (!g_sess.listening || g_sess.dead) return 0;
+    dap_mutex_init();
+    dap_mutex_lock();
+
+    if (!g_sess.listening || g_sess.dead) goto out;
 
     evs = as_take_events(&n);
     for (i = 0; i < n; i++) {
@@ -772,7 +777,7 @@ int dap_session_update(lua_State *L) {
                                         evs[i].len) != 0) {
                     as_events_free(evs, n);
                     dap_session_reset_client(L, NULL);
-                    return 0;
+                    goto out;
                 }
             }
         } else if (evs[i].type == AS_EVT_CLOSE) {
@@ -793,13 +798,13 @@ int dap_session_update(lua_State *L) {
         if (pr < 0) {
             free(json);
             dap_session_reset_client(L, NULL);
-            return 0;
+            goto out;
         }
         msg = dap_json_parse(json, jlen);
         free(json);
         if (!msg) {
             dap_session_reset_client(L, NULL);
-            return 0;
+            goto out;
         }
         dispatch(L, msg);
         cJSON_Delete(msg);
@@ -818,11 +823,18 @@ int dap_session_update(lua_State *L) {
     }
     if (!g_sess.dead)
         coro_registry_purge_dead(L);
-    return 0;
+
+out:
+    dap_mutex_unlock();
+    return rc;
 }
 
 int dap_session_start(lua_State *L, const char *host, int port, int wait) {
     char err[256];
+    int rc = 0;
+
+    dap_mutex_init();
+    dap_mutex_lock();
 
     if (g_sess.listening || g_sess.recv_buf.data || g_sess.bp_files)
         dap_session_shutdown(L, NULL);
@@ -833,10 +845,14 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
     g_sess.next_ref = 1000;
     g_sess.dap_conn_id = 0;
 
-    if (as_net_init() != 0) return -1;
+    if (as_net_init() != 0) {
+        rc = -1;
+        goto out;
+    }
     if (as_listen(host, port, err, sizeof(err)) != 0) {
         fprintf(stderr, "[luadap] listen failed: %s\n", err);
-        return -1;
+        rc = -1;
+        goto out;
     }
     g_sess.listening = 1;
     fprintf(stderr, "[luadap] listening on %s:%d\n", host, port);
@@ -860,5 +876,8 @@ int dap_session_start(lua_State *L, const char *host, int port, int wait) {
             coro_registry_install_hooks_all();
         }
     }
-    return 0;
+
+out:
+    dap_mutex_unlock();
+    return rc;
 }

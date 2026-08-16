@@ -5,6 +5,7 @@ set(LUADAP_SOURCES
     coro_registry.c
     dap_framing.c
     dap_json.c
+    dap_sync.c
     dap_session.c
     lua_debug.c
     ${CMAKE_SOURCE_DIR}/3rd/cJSON/cJSON.c)
