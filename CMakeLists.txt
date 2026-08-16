@@ -73,4 +73,5 @@ add_subdirectory(native/asyncsocket)
 add_subdirectory(native/luadap)
 add_subdirectory(native/lua-runner)
 add_subdirectory(sample)
+add_subdirectory(test)
 # 后续可以在这里添加库、子目录和测试
