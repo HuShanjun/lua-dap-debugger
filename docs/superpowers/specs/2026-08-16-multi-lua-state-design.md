@@ -2,22 +2,28 @@
 
 **日期：** 2026-08-16  
 **状态：** 已批准待实现  
-**范围：** `native/luadap`（`dap_session` / `coro_registry` / `lua_debug` / `luadap.c`）、宿主用法、测试；VS Code 扩展无需改协议面（仍一个 TCP DAP）
+**范围：** `native/luadap`（`dap_session` / `coro_registry` / `lua_debug` / `luadap.c`）、必要时 `asyncsocket` 泵约定、宿主用法、测试；VS Code 扩展无需改协议面（仍一个 TCP DAP）
 
 ---
 
 ## 背景与目标
 
-当前 `luadap` 进程内只有一个全局 `dap_session`，`coro_registry` 挂在单一 `g_mainL` 上。宿主若创建多个独立 `lua_State`（多 VM），只能调试其中一个，或开多个端口（本设计不做）。
+当前 `luadap` 进程内只有一个全局 `dap_session`，`coro_registry` 挂在单一 `g_mainL` 上，且假定单线程泵 DAP。宿主若创建多个独立 `lua_State`（可在不同 OS 线程），无法安全地共用一次调试会话。
 
-**目标：** 同一进程、同一 DAP listen / 同一 VS Code 调试会话内，注册多个 main `lua_State`；Threads 扁平展示各 state 的主线程及其协程；断点只暂停命中的那个执行流。
+**目标：**
 
-**非目标（V1）：**
+1. 同一进程、同一 DAP listen / 同一 VS Code 会话内，注册多个 main `lua_State`。  
+2. Threads 扁平展示各 state 的主线程及其协程。  
+3. 断点只暂停命中的执行流；**其它 OS 线程上的其它 state 继续真并行**。  
+4. **跨 OS 线程** 调用 `start` / `update` / `track` / hook 暂停路径 **无数据竞争**（方案 A：会话短锁 + 无锁睡眠）。
 
-- 多个 DAP listen / 多个 VS Code 会话并行
-- 命中断点时冻结其它 state（`allThreadsStopped` 保持 false）
-- 跨 state 的 variables / evaluate
-- 改变 `asyncsocket`「全进程一个 listen」限制
+**非目标（本版仍不做）：**
+
+- 多个 DAP listen / 多个 VS Code 会话并行  
+- `allThreadsStopped: true`（全局冻结）  
+- 跨 state 的 variables / evaluate（变量域仍绑定暂停中的那个 `L`）  
+- 改变 `asyncsocket`「全进程一个 listen」；不引入专用 DAP 泵线程（方案 B）  
+- 同一 `lua_State*` 被多 OS 线程 concurrently 进入（仍遵守 Lua 规则：一 L 一拥有线程）
 
 ---
 
@@ -26,10 +32,12 @@
 | 项 | 选择 |
 |----|------|
 | 产品形态 | 多 VM **共用一个** DAP 会话 |
-| 暂停语义 | **只停**触发 hook 的那个 `lua_State` / 协程 |
-| Threads | **扁平**：每个 mainL + 其协程均为独立 DAP thread；名称带 state 前缀 |
-| 注册 API | 每个 state 均可 `require("luadap"); dap.start(...)`；**同 host+port 自动并入** |
-| 并入策略 | 方案 A：首 `start` 建 listen；同 host/port 再 `start` 只 join；不同 port → 错误 |
+| 暂停语义 | 只停触发 hook 的执行流；**其它 OS 线程上的 state 继续跑** |
+| 多暂停 | **允许** 多个 DAP thread 同时处于 stopped（多次 `stopped`，`allThreadsStopped: false`） |
+| Threads | **扁平**：mainL + 协程；名称带 state 前缀 |
+| 注册 API | 每 state 均可 `dap.start`；**同 host+port 自动 join**；不同 port → 错误 |
+| 跨线程 | **方案 A**：会话互斥锁保护共享结构；`pause_loop` **不持锁睡眠**；禁止持锁调 Lua |
+| 泵 DAP | 任一线程的 `dap.update()` 或任一 `pause_loop` 内的 `update`；短锁串行化 |
 
 ---
 
@@ -38,146 +46,168 @@
 ### Lua
 
 ```lua
--- 首次：创建 listen + 登记本 state
-dap.start(host, port, wait [, name])
-
--- 其它 lua_State：同 host/port → join（不新建 listen）
-dap.start(host, port, wait [, name])
-
-dap.update()   -- 任一已注册 state 调用均可；泵同一 asyncsocket
-dap.track(co [, name])  -- 语义不变；归属调用方所在 mainL 的 state
+dap.start(host, port, wait [, name])  -- 首 call 建 listen；同 host/port join
+dap.update()                          -- 任意已注册 state、任意拥有线程可调
+dap.track(co [, name])
 ```
 
-- `name`（可选 string）：该 main state 在 Threads 中的前缀；缺省 `state-1`、`state-2`、…
-- `wait=true`：若会话尚未 `configurationDone`，join 与首次 start 一样阻塞等待；若已 configured，立即返回
-- 已有会话且 `(host, port)` 不一致：`start` 失败（Lua error / C 非 0）
+- `name`（可选）：Threads 前缀；仅一个 state 且未传 name → 主线程名 `main`；多 state 未传 → `state-N`
+- `wait=true`：会话尚未 `configurationDone` 则阻塞等待；已 configured 则立即返回
+- `(host,port)` 与已有会话不一致 → 失败
 
-### 行为不变
+### 行为不变 / 强化
 
-- 仍只接受 **一个** DAP client；第二连接关掉
-- `disconnect` 结束 client、保留 listen；已登记的 states / hooks 策略见下文「Disconnect」
+- 仍只接受 **一个** DAP client  
+- `continue` / `next` / `stepIn` / `stepOut`：**必须按 `threadId` 只恢复/步进对应暂停流**（省略或错误 id → 失败或仅当唯一暂停时兼容，实现时写死：**推荐要求匹配 paused 集合中的 id**）  
+- `stackTrace`：对该 thread 若在暂停集合中则出栈，否则空栈  
+
+---
+
+## 线程安全模型（方案 A）
+
+### 锁
+
+- 一把进程级 **`session_mutex`**（可递归或文档禁止重入；推荐 **非递归** + 明确临界区不嵌套）。  
+- **持锁允许：** 改 `dap_session`、`state_registry`、`coro_registry` 元数据、断点表、组 DAP 帧、`as_conn_send` / `as_take_events` 消费（若 asyncsocket API 非线程安全，则 **所有** asyncsocket 调用也仅在持锁下进行）。  
+- **持锁禁止：** 任何 `lua_*` 进入用户脚本 / `lua_pcall` / 读任意 `lua_State` 的栈做 evaluate（evaluate/stack 在放锁后、且仅在该 L 的拥有线程上执行——见下）。
+
+### 所有权
+
+- 每个 `lua_State`（含其协程）只由 **创建/驱动它的 OS 线程** 调用 Lua 与安装 hook。  
+- 其它线程不得对该 `L` 调 `lua_getstack` / `evaluate`；DAP 请求若需要读栈，必须 **投递到拥有线程** 或仅在该线程已处于 `pause_loop`、由该线程自己在放锁后处理。  
+
+**本版采用的读栈策略（与现单线程兼容、多线程正确）：**
+
+- `stackTrace` / `scopes` / `variables` / `evaluate` 只服务 **已在暂停集合中的 threadId**。  
+- 处理这些请求时：持锁校验 id ∈ paused，取出 `L` 指针后 **释放锁**，在 **当前正在执行 `pause_loop` 的那条 OS 线程** 上跑 Lua（即：请求必须由该暂停线程的 `update`/`pause_loop` 路径处理，而不是由另一线程的 `update` 直接摸别人的 `L`）。  
+- 实现要点：`update` 在持锁下只把入站 DAP 请求放入队列；**真正 `dispatch` 里碰 Lua 的命令**，若 target `L` 不是「本线程正在 pause 的 L」，则留在队列，等拥有线程的 `pause_loop`/`update` 再取。不碰 Lua 的命令（`initialize`、`setBreakpoints`、`threads`、`continue`、`disconnect` 等）可在任意 `update` 持锁路径执行。
+
+### Hook → 暂停
+
+```
+on_line_hook(L):
+  快速判断（可持锁读断点/step 标志，立刻放锁）
+  若需停:
+    持锁: 加入 paused 集合，分配/确认 threadId，发送 stopped 事件
+    放锁
+    pause_loop(L):
+      while 本 thread 仍在 paused 集合:
+        持锁: 泵 asyncsocket + 处理「非 Lua 或本 L 的」DAP 请求
+        放锁
+        若仍 paused: 短睡或 condvar 等（continue 时 signal）
+      持锁: 清本 thread 的 step/paused 项（若 continue 已清则可跳过）
+      放锁
+      return 到 Lua
+```
+
+- **不持锁睡眠**，故其它线程可继续跑 Lua、可再断下、可 `update`。  
+- 多个 `pause_loop` 同时跑时，靠 `session_mutex` 串行化泵与发送。
+
+### `continue` / `step*`
+
+- 持锁：按 `threadId` 从 paused 集合移除（或设 step 标志仅绑定该 `L`），`cond_signal` 对应等待者。  
+- 不匹配的 `threadId` → 失败响应。  
+- 旧客户端不传 `threadId`：若 paused 恰有 1 个则作用其上，否则失败（写进实现与测试）。
 
 ---
 
 ## 内部模型
 
-### `state_registry`（新）
+### `state_registry`
 
 ```
-state {
-  id          -- 稳定序号 1..N（用于缺省命名）
-  mainL       -- 该 VM 的主 lua_State*
-  name[64]    -- Threads 前缀
-}
+state { id, mainL, name[64] }
 ```
 
-- 进程内列表；`start`/join 时追加；shutdown 时清空
-- `mainL` 指针相等则视为已登记：重复 `start` 同 L → no-op 成功（或仅更新 name，V1 选 no-op）
+- `start`/join 追加；同 `mainL` 重复 start → no-op  
+- 所有访问在 `session_mutex` 下  
 
-### `coro_registry`（扩展）
+### `coro_registry`
 
-今日：`g_mainL` + 全局 entries，thread id 从 2 起，id 1 = main。
-
-改为：
-
-- entries 增加 `state_id`（或 `mainL` 指针）归属
-- **每个**登记的 mainL：创建 id 时登记一条「main」线程；安装 `coroutine.create`/`wrap` 包装（包装函数闭包在该 mainL）
-- DAP `threadId` **全局唯一**（继续用单调 `g_next_id`，不按 state 重置）
-- 显示名：
-  - main：`{stateName}`（若仅一 state 可仍显示 `main` 以兼容？**V1 统一用 stateName**，单 state 缺省名 `state-1`；或单 state 时缺省名 `main`——**采用：仅一个 state 且未传 name 时名为 `main`；多 state 未传 name 时为 `state-N`**）
-  - 协程：`{stateName}/{coroName}`，`coroName` 同今日（`coro-%d` 或 `track` 名）
+- entries 带归属 `mainL` / `state_id`  
+- 每 mainL 登记 main 线程 + 包装该 L 上的 `coroutine.create`/`wrap`  
+- `threadId` 全局单调唯一  
+- 显示名：`{stateName}` / `{stateName}/{coroName}`；单 state 无 name 时主线程为 `main`  
 
 ### `dap_session`
 
-- 仍单例；增加「已 listen 的 host/port」缓存供 join 比对
-- `paused_L` / `step_L` / `paused_thread_id` 语义不变（只指向当前暂停执行流）
-- `reset_client` / hooks：须对 **所有** 已登记 mainL 清/重装 hook（见 Disconnect）
-- 断点表仍会话级共享
-
-### Hook / pause
-
-- 各 mainL（及 track 的协程）均 `lua_sethook`
-- `on_line_hook` → `pause_loop(L)` 只阻塞该 `L`；`stopped` 事件带该 threadId，`allThreadsStopped: false`
-- 其它 state 继续执行；对其 `stackTrace` 在未暂停时返回空栈（与现协程行为一致）
-
-### `update`
-
-- `dap_session_update(L)` 不依赖传入 L 的身份（只要会话 listening）；传入 L 仅用于 dispatch 里需要「默认 state」的少数路径
-- `stackTrace` / `variables` / `evaluate` 仍以 `paused_L` / `threadId → coro_registry_state_for` 解析，须能解析跨 state 的 thread
+- 单例 + `listen_host` / `listen_port`  
+- **`paused` 从单槽改为集合**：`threadId → { L, condvar/世代 }`  
+- `step` 绑定具体 `L` + threadId（可多 thread 各有 step，或 V1 步进仍只对「刚操作的」那个；**推荐每 paused thread 独立 step 槽**）  
+- 断点表会话共享，持锁读写  
 
 ### Disconnect / re-attach
 
-- **Client disconnect（保留 listen）：** 清除 paused/step、断点、recv；对 **所有** 登记 mainL `lua_debug_clear_hook`；`configured=0` 等待再 attach。states 与 coro 包装 **保留**（与今日「不拆 coro wrappers」一致），再 attach 成功 / `configurationDone` 后对所有 mainL 重新 `install_hook`
-- **进程级 shutdown：** 卸所有包装、clear registry、关 listen（今日 `dap_session_shutdown` 扩展为遍历 states）
+- Client disconnect：持锁唤醒并清空 **全部** paused；清断点/recv；对所有 mainL 清 hook（清 hook 须在各拥有线程？`lua_sethook` 对非运行中 L 通常可从他线程调用，但为稳妥：**持锁只标 `hooks_armed=0`，各线程下一次 `update`/进 hook 前见标志则 `clear_hook`**；或 disconnect 路径文档要求宿主停妥后单线程调用——**推荐：disconnect 时持锁设标志，各 `pause_loop`/`update` 在本线程对所属 L 卸 hook**）  
+- 再 attach / `configurationDone` 后各线程本 L 再 `install_hook`  
+- 进程 shutdown：唤醒所有等待者，卸包装，清 registry，关 listen  
 
 ---
 
 ## 宿主用法示例
 
 ```cpp
-// VM A
+// Thread 1
 lua_State* A = luaL_newstate();
-luaL_requiref(A, "luadap", luaopen_luadap, 0); lua_pop(A, 1);
-lua_getglobal(A, "require"); // or set package.cpath and dostring:
-// dap.start("127.0.0.1", 8172, false, "logic")
+// require luadap; dap.start("127.0.0.1", 8172, false, "logic")
+for (;;) { /* run A */ dap.update via A; }
 
-// VM B
+// Thread 2
 lua_State* B = luaL_newstate();
-// dap.start("127.0.0.1", 8172, false, "ui")  -- joins
-
-for (;;) {
-  // 业务 tick A / B
-  // 任选一处泵 DAP：
-  dap_update_from(A);  // or B
-}
+// dap.start("127.0.0.1", 8172, false, "ui")  -- join
+for (;;) { /* run B */ dap.update via B; }
 ```
 
-`sample` 可后续加可选第二 state 演示；**V1 以测试为准，不强制改 sample。**
+同线程多 state 仍可用，但一 state 进入 `pause_loop` 会挡住该线程上其它 state 的调度（不是数据竞争，是调度限制）。
+
+`sample` 不强制改；以测试宿主为准。
 
 ---
 
 ## 测试
 
-新增（建议）：
-
-1. **`test_dap_multi_state_threads.py`**  
-   - 两个 Lua 进程内 state：实际用 **一个** `lua.exe` 无法两 state；应用 **C 小宿主** 或 **Lua 无法跨 newstate**——应用 **嵌入式测试**：扩展现有 debugee，或新增 `tools`/`test` 下用 `lua-runner` 变体。  
-   - 实用路径：新增 `test/run_debugee_multi_state.c` 或在 Python 中起 **两个** 通过 **同一 DLL 会话** 的路径——因 `luadap` 会话是 **进程内全局**，必须 **同一进程两个 lua_State**。  
-   - **方案：** 小 C 测试宿主 `test_host_multi_state`（或扩 `lua-runner` 不合适）→ 更轻：在 `test/` 增加由 `lua.exe` + 无法实现；故 **CMake 测试可执行文件** `multi_state_dap_host`：创建 A/B，`start` 同端口，打印 listening，供 Python DAP client 连上后 `threads` 断言 ≥2 个 main 名。
-
-2. **Handshake join：** B join 后 `threads` 含 `logic` 与 `ui`（或 `state-1`/`state-2`）
-
-3. **Pause isolation：** A 脚本断点停下时 B 仍能通过「B 侧共享计数/文件心跳」证明在跑（或 B 不在 pause_loop）；`stackTrace(A)` 非空，`stackTrace(B)` 空
-
-4. **Port mismatch：** 第二 state `start` 不同 port → 失败
-
-5. 回归：现有单 state 协程 / handshake / evaluate / condition 全绿
+1. **同线程双 state：** `multi_state_dap_host`（单线程轮询 A/B）— threads 名、join、port mismatch  
+2. **跨线程双 state：** 两 OS 线程各一 L；A 断下后 B 用原子心跳证明仍在跑；再让 B 断下 → 两个 stopped；分别 `continue`  
+3. **并发 `update`：** 两线程同时猛调 `update` + 一侧 pause，ASAN/TSan（若 CI 有）或压力下无崩溃、DAP 仍可 continue  
+4. **错误 port join** 失败  
+5. 现有 `test/test_dap_*.py` 回归  
 
 ---
 
 ## 实现分期（建议）
 
-1. `state_registry` + `start` join / port 校验 + 多 main hook 安装  
-2. `coro_registry` 多 mainL + 线程命名前缀 + `threads` 列表  
-3. `reset_client` / shutdown 遍历所有 state  
-4. 多 state 测试宿主 + Python 用例  
-5. README 简述
+1. `session_mutex` + 临界区梳理（先单 paused 行为不变，通回归）  
+2. `paused` 集合 + 按 `threadId` 的 continue/step + `pause_loop` 无锁等  
+3. DAP 请求队列：碰 Lua 的命令仅在拥有/暂停线程 dispatch  
+4. `state_registry` + `start` join + 多 main hook / coro 前缀名  
+5. 同线程 + 跨线程测试宿主与 Python 用例  
+6. README：多 state、跨线程约定、同线程暂停挡调度说明  
 
 ---
 
 ## 风险与注意
 
-- **Registry refs：** 每个 mainL 的 `LUA_REGISTRYINDEX` 独立；coro `reg_ref` 必须对所属 mainL `luaL_ref/unref`
-- **Hook 与死锁：** 只停一 state 时，宿主若在 **同一 OS 线程** 交替 resume A/B，A 在 `pause_loop` 内调 `update` 即可继续服务 DAP；若 B 的逻辑也在同线程且 A 卡住，B 也不会跑——这是单线程宿主固有限制，文档写明：**多 state 同线程时，暂停会拖住同线程上其它 state 的调度**；真并行需多 OS 线程（V1 不保证跨线程安全，除非 asyncsocket/luadap 已假设单线程泵）
-- **线程安全：** V1 保持「单线程调用 `update`/Lua」约定；多 OS 线程各跑一 state **不在 V1 范围**
-- **单 state 兼容：** 未传 `name` 且仅一 state → 线程名 `main` / `coro-N`，行为与现网一致
+- **asyncsocket：** 若底层非线程安全，必须把所有 `as_*` 放进 `session_mutex`；评估 poll 线程与主泵的现有约定是否已被锁覆盖。  
+- **死锁：** 禁止 `lua_pcall` → 用户代码 → 再 `dap.update` 时持锁；`pause_loop` 必须先放锁。  
+- **Lua 所有权：** 绝不以线程 B 的 `update` 去 `lua_getstack(A)`。  
+- **同 OS 线程多 state：** 暂停仍会卡住同线程兄弟 state——文档写明；真并行用多线程。  
+- **VS Code：** 多 stopped 时 UI 以当前 thread 为准；扩展侧无需改。  
 
 ---
 
 ## 验收标准
 
-- [ ] 同进程两 `lua_State` 同 host/port 两次 `start`，VS Code / Python 看到两个 main thread（及各自协程）
-- [ ] 一侧断点暂停时 `stopped.threadId` 对应该侧；另一侧 main 的 `stackTrace` 为空且不要求 `allThreadsStopped`
-- [ ] 不同 port 第二次 `start` 失败
-- [ ] 现有 `test/test_dap_*.py` 回归通过
-- [ ] README 有多 state 用法小节段
+- [ ] 同进程两 `lua_State` 同 host/port 两次 `start`，Threads 可见两个 main（及协程）  
+- [ ] **两 OS 线程** 下 A 暂停时 B 心跳仍前进；A、B 可同时处于 stopped  
+- [ ] `continue`/`step` 按 `threadId` 只恢复对应流  
+- [ ] 不同 port 第二次 `start` 失败  
+- [ ] 双线程压力 `update` 下无数据竞争导致的崩溃/协议错乱（至少 Debug 构建 + 回归）  
+- [ ] 现有 `test/test_dap_*.py` 通过  
+- [ ] README 含多 state 与跨线程用法/限制  
+
+---
+
+## 修订记录
+
+- 2026-08-16：初版（多 state join；当时写明跨线程非目标）  
+- 2026-08-16：纳入跨线程方案 A、多 paused 集合、碰 Lua 请求的线程亲和 dispatch  
