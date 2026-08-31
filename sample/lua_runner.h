@@ -4,11 +4,11 @@
 class LuaRunner
 {
     LuaRunner(const LuaRunner&) = delete;
-    LuaRunner(LuaRunner&&) = delete;
     LuaRunner& operator=(const LuaRunner&) = delete;
-    LuaRunner& operator=(LuaRunner&&) = delete;
     
 public:
+    LuaRunner(LuaRunner&&) = default;
+    LuaRunner& operator=(LuaRunner&&) = default;
     LuaRunner();
     ~LuaRunner();
 

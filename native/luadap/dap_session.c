@@ -257,8 +257,11 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
-/* Path normalize (same as debugger.lua): strip leading @, \→/, lowercase
- * drive letter, strip trailing /. Returns malloc'd string; caller frees. */
+/* Path normalize: strip leading @, \→/, strip trailing /.
+ * On Windows, lowercase the whole path so setBreakpoints clear and hook
+ * getinfo agree when VS Code / the filesystem disagree on casing (common
+ * multi-thread hosts load one absolute path while the editor sends another).
+ * Elsewhere only the drive letter is lowercased (historical behavior). */
 char *dap_session_normalize_path(const char *path) {
     char *out;
     size_t n, i, w;
@@ -269,11 +272,18 @@ char *dap_session_normalize_path(const char *path) {
     out = (char *)malloc(n + 1);
     if (!out) return NULL;
     w = 0;
-    for (i = 0; i < n; i++)
-        out[w++] = (char)((path[i] == '\\') ? '/' : path[i]);
+    for (i = 0; i < n; i++) {
+        char c = (char)((path[i] == '\\') ? '/' : path[i]);
+#if defined(_WIN32)
+        c = (char)tolower((unsigned char)c);
+#endif
+        out[w++] = c;
+    }
     out[w] = '\0';
+#if !defined(_WIN32)
     if (w >= 2 && out[1] == ':' && isalpha((unsigned char)out[0]))
         out[0] = (char)tolower((unsigned char)out[0]);
+#endif
     while (w > 0 && out[w - 1] == '/') {
         out[--w] = '\0';
     }
@@ -303,6 +313,21 @@ static void bp_clear_file(dap_bp_file *f) {
     free(f->items);
     f->items = NULL;
     f->n = 0;
+}
+
+/* Remove one source entry from the session table (after clear-to-empty). */
+static void bp_remove_file(dap_bp_file *f) {
+    size_t i;
+    if (!f || !g_sess.bp_files) return;
+    i = (size_t)(f - g_sess.bp_files);
+    if (i >= g_sess.bp_n) return;
+    bp_clear_file(f);
+    free(f->path);
+    f->path = NULL;
+    if (i + 1 < g_sess.bp_n)
+        memmove(&g_sess.bp_files[i], &g_sess.bp_files[i + 1],
+                (g_sess.bp_n - i - 1) * sizeof(g_sess.bp_files[0]));
+    g_sess.bp_n--;
 }
 
 static void bp_clear_all(void) {
@@ -670,12 +695,21 @@ static void handle_set_breakpoints(cJSON *req) {
 
     n = cJSON_IsArray(in) ? cJSON_GetArraySize(in) : 0;
     if (n < 0) n = 0;
-    if (n > 0) {
-        file->items = (dap_bp *)calloc((size_t)n, sizeof(dap_bp));
-        if (!file->items) {
-            send_response(req, NULL, 0, "oom");
-            return;
-        }
+    /* Empty list = clear this source. Drop the file slot so a later clear
+     * with a differently-cased alias cannot leave a stale populated entry. */
+    if (n == 0) {
+        bp_remove_file(file);
+        body = cJSON_CreateObject();
+        if (body)
+            cJSON_AddArrayToObject(body, "breakpoints");
+        send_response(req, body, 1, NULL);
+        return;
+    }
+
+    file->items = (dap_bp *)calloc((size_t)n, sizeof(dap_bp));
+    if (!file->items) {
+        send_response(req, NULL, 0, "oom");
+        return;
     }
 
     body = cJSON_CreateObject();

@@ -13,8 +13,8 @@ int dap_session_start_ex(lua_State *L, const char *host, int port, int wait,
 int dap_session_update(lua_State *L);
 void dap_session_shutdown(lua_State *L, cJSON *disconnect_req /* nullable */);
 
-/* Path normalize (debugger.lua): strip @, \→/, lowercase drive, strip trailing /.
- * Returns malloc'd string; caller frees. */
+/* Path normalize: strip @, \→/, strip trailing /. On Windows lowercase all
+ * path characters so editor clear and Lua getinfo agree on casing. */
 char *dap_session_normalize_path(const char *path);
 
 /* Snapshot BP table under session_mutex. 1 if path+line has a BP.

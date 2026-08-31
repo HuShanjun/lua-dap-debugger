@@ -882,13 +882,22 @@ static void on_line_hook(lua_State *L, lua_Debug *ar) {
         free(cond);
         cond = NULL;
         if (hit) {
-            free(path);
-            pause_loop(L, "breakpoint");
-            return;
+            /* Another thread may have cleared the BP while we evaluated the
+             * condition (multi-OS-thread hosts). Re-check before pausing. */
+            if (!dap_session_bp_snapshot(path, line, NULL)) {
+                free(path);
+                path = NULL;
+                /* fall through to step checks */
+            } else {
+                free(path);
+                pause_loop(L, "breakpoint");
+                return;
+            }
         }
         /* Condition false: do not stop; still allow stepping below. */
     }
-    free(path);
+    if (path)
+        free(path);
 
     /* Gold on_line after BP: in → next user line; over when d <= step_depth;
      * out when d < step_depth. Step is bound to this L's step slot. */

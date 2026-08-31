@@ -60,14 +60,13 @@ int main(void) {
     arr = cJSON_CreateArray();
     expect(arr && coro_registry_append_threads_json(arr) == 0, "append single");
     nm = json_name_for_id(arr, 1);
-    expect(nm && strcmp(nm, "main") == 0, "alone main name is main");
+    expect(nm && strcmp(nm, "main/main") == 0, "alone main name is main/main");
     nm = json_name_for_id(arr, id_co);
-    expect(nm && strncmp(nm, "coro-", 5) == 0, "alone coro-N unprefixed");
-    expect(nm && strchr(nm, '/') == NULL, "alone coro has no state prefix");
+    expect(nm && strstr(nm, "main/coro-") == nm, "alone coro is main/coro-N");
     cJSON_Delete(arr);
 
     expect(state_registry_add(b, "ui") >= 2, "second state added");
-    id_b = coro_registry_track(b, b, "ui");
+    id_b = coro_registry_track(b, b, NULL);
     expect(id_b != 0, "second main tracked");
     expect(id_b != 1, "second main must not steal threadId=1");
     expect(id_b != id_a, "thread ids unique");
@@ -77,9 +76,9 @@ int main(void) {
     arr = cJSON_CreateArray();
     expect(arr && coro_registry_append_threads_json(arr) == 0, "append multi");
     nm = json_name_for_id(arr, 1);
-    expect(nm && strcmp(nm, "main") == 0, "multi first main is state name");
+    expect(nm && strcmp(nm, "main/main") == 0, "multi first main is main/main");
     nm = json_name_for_id(arr, id_b);
-    expect(nm && strcmp(nm, "ui") == 0, "multi second main is ui");
+    expect(nm && strcmp(nm, "ui/main") == 0, "multi second main is ui/main");
     nm = json_name_for_id(arr, id_co);
     expect(nm && strstr(nm, "main/") == nm, "multi coro is state/coro");
     cJSON_Delete(arr);

@@ -112,8 +112,8 @@ def main():
         resp = wait_cmd(c, "threads")
         assert resp.get("success") is True, resp
         threads = (resp.get("body") or {}).get("threads") or []
-        logic = next(t for t in threads if t.get("name") == "logic")
-        ui = next(t for t in threads if t.get("name") == "ui")
+        logic = next(t for t in threads if t.get("name") == "logic/main")
+        ui = next(t for t in threads if t.get("name") == "ui/main")
         assert logic.get("id") != ui.get("id"), threads
 
         c.send_request(
@@ -169,7 +169,7 @@ def main():
         c.send_request("threads", {})
         resp2 = wait_cmd(c, "threads")
         names = [t.get("name") for t in ((resp2.get("body") or {}).get("threads") or [])]
-        assert "logic" in names and "ui" in names, resp2
+        assert "logic/main" in names and "ui/main" in names, resp2
 
         inspect_paused(c, logic["id"], "x", "1")
         inspect_paused(c, ui["id"], "y", "2")

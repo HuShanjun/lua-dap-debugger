@@ -101,7 +101,7 @@ def main():
         ids = [t.get("id") for t in threads]
         names = [t.get("name") for t in threads]
         assert 1 in ids, threads
-        assert "main" in names, threads
+        assert "main/main" in names, threads
         assert tid in ids, threads
 
         c.send_request("stackTrace", {"threadId": tid})

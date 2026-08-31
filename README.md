@@ -246,8 +246,18 @@ Continue / Step Over / Step Into / Step Out 可用。Watch 与 Hover 求值只�
 
 ## 自动化冒烟（可选）
 
+完整说明见 [`test/README.md`](test/README.md)（**每个用例作用**、编译、一键跑全量）。
+
+```powershell
+# 一键跑全部回归
+.\test\run_all_tests.ps1
+# 或
+python test/run_all_tests.py
+```
+
 ```powershell
 cd E:\demo\lua-dap-debugger
+$env:PATH = "$pwd\bin;$env:PATH"
 python test/test_asyncsocket_smoke.py
 python test/test_asyncsocket_multi.py
 python test/test_asyncsocket_connect.py

@@ -28,6 +28,7 @@ void LuaRunner::Init()
     lua_.safe_script(launch_dbg);
     AddScriptPath("E:/demo/lua-dap-debugger/sample/script");
     AddLibraryPath("E:/demo/lua-dap-debugger/bin");
+    
     RunFile("E:/demo/lua-dap-debugger/sample/script/main.lua");
 
     GetLuaFunction("update", main_update_);

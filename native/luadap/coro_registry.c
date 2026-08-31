@@ -95,30 +95,21 @@ static int coro_is_dead(lua_State *co) {
 static void set_name(coro_entry *e, const char *name_opt) {
     if (name_opt && name_opt[0])
         snprintf(e->name, sizeof(e->name), "%s", name_opt);
-    else if (e->is_main) {
-        const char *sn = state_registry_name(e->mainL);
-        if (sn && sn[0])
-            snprintf(e->name, sizeof(e->name), "%s", sn);
-        else if (e->id == 1)
-            snprintf(e->name, sizeof(e->name), "main");
-        else
-            snprintf(e->name, sizeof(e->name), "state-%d", e->id);
-    } else
+    else if (e->is_main)
+        snprintf(e->name, sizeof(e->name), "main");
+    else
         snprintf(e->name, sizeof(e->name), "coro-%d", e->id);
 }
 
+/* Display: "{state}/main" for mainL, "{state}/{coro}" for others. */
 static void format_thread_name(const coro_entry *e, char *out, size_t outsz) {
     const char *state;
 
-    if (state_registry_count() <= 1) {
-        snprintf(out, outsz, "%s", e->name);
-        return;
-    }
     state = state_registry_name(e->mainL);
     if (!state || !state[0])
-        state = e->is_main ? e->name : "state";
+        state = "main";
     if (e->is_main)
-        snprintf(out, outsz, "%s", state);
+        snprintf(out, outsz, "%s/main", state);
     else
         snprintf(out, outsz, "%s/%s", state, e->name);
 }

@@ -1,4 +1,5 @@
 """Same-thread dual lua_State DAP: both mains, BP on A, empty stack on B."""
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -101,10 +102,10 @@ def test_same_thread_multi_state():
         assert resp.get("success") is True, resp
         threads = (resp.get("body") or {}).get("threads") or []
         names = [t.get("name") for t in threads]
-        assert any(n == "logic" for n in names), threads
-        assert any(n == "ui" for n in names), threads
-        logic = next(t for t in threads if t.get("name") == "logic")
-        ui = next(t for t in threads if t.get("name") == "ui")
+        assert any(n == "logic/main" for n in names), threads
+        assert any(n == "ui/main" for n in names), threads
+        logic = next(t for t in threads if t.get("name") == "logic/main")
+        ui = next(t for t in threads if t.get("name") == "ui/main")
         assert logic.get("id") != ui.get("id"), threads
 
         c.send_request(
@@ -148,12 +149,45 @@ def test_same_thread_multi_state():
         frames_a = (st_a.get("body") or {}).get("stackFrames") or []
         assert frames_a, st_a
 
+        # Clear while paused using a differently-cased path (VS Code / Win32
+        # often disagree with Lua @source). Must not leave a stale BP entry.
+        clear_src = src
+        if clear_src[0].isalpha() and len(clear_src) > 1 and clear_src[1] == ":":
+            clear_src = clear_src[0].swapcase() + clear_src[1:]
+        clear_src = clear_src.replace("test/", "Test/", 1).replace("test\\", "Test\\", 1)
+        c.send_request(
+            "setBreakpoints",
+            {"source": {"path": clear_src}, "breakpoints": []},
+        )
+        c.wait_for(
+            lambda m: m.get("type") == "response"
+            and m.get("command") == "setBreakpoints",
+            limit=40,
+        )
+
         c.send_request("continue", {"threadId": logic["id"]})
         cont = c.wait_for(
             lambda m: m.get("type") == "response" and m.get("command") == "continue",
             limit=40,
         )
         assert cont.get("success") is True, cont
+
+        old_timeout = c.sock.gettimeout()
+        c.sock.settimeout(0.15)
+        try:
+            deadline = time.time() + 0.8
+            while time.time() < deadline:
+                try:
+                    msg = c.read_message()
+                except (TimeoutError, socket.timeout, OSError):
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "stopped":
+                    if (msg.get("body") or {}).get("reason") == "breakpoint":
+                        raise AssertionError(
+                            "hit breakpoint after clear (path casing?): %r" % (msg,)
+                        )
+        finally:
+            c.sock.settimeout(old_timeout)
     finally:
         try:
             proc.kill()
