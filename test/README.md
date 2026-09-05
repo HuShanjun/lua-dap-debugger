@@ -67,7 +67,7 @@ cmake --build build/msvc --config Release --target `
 
 | 产物 | 谁在用 |
 |------|--------|
-| `bin/lua.exe` | 多数 Python DAP / asyncsocket 用例 |
+| `bin/lua5.x/lua.exe`（或 `bin/lua.exe`） | 多数 Python DAP / asyncsocket 用例 |
 | `bin/luadap.dll` | `require("luadap")` |
 | `bin/asyncsocket.dll` | asyncsocket 用例 |
 | `bin/lua-runner.exe` | `test_dap_runner_handshake.py` |

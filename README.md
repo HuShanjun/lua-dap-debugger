@@ -28,8 +28,10 @@ lua-dap-debugger/
 │   └── lua-runner/               # Launch 用 CLI：链接 liblua + luadap_static
 ├── vscode-extension/             # type: lua-dap（Launch spawn runner / Attach 端口）
 ├── test/                         # Python DAP / asyncsocket 回归
-├── 3rd/                          # sol2、nlohmann、vendored Lua 源码树
-├── bin/                          # 编译产物：lua-runner.exe、sample.exe、luadap.dll、lua.exe …
+├── 3rd/                          # Lua 5.x（CMake 输出到 bin/lua5.x）、sol2、nlohmann
+├── bin/
+│   ├── lua5.1/ … lua5.4/         # 各版本 liblua / lua / luac
+│   └── …                         # luadap.dll、lua-runner.exe、sample 等
 └── .vscode/launch.json           # Debug Sample / Extension Host / lua-dap Launch·Attach
 ```
 
@@ -121,20 +123,24 @@ end
 
 ## Lua 5.1–5.4 兼容
 
-`asyncsocket` 与 `luadap` 支持 **Lua 5.1 / 5.2 / 5.3 / 5.4**（不含 LuaJIT）。当前 CMake **必须**指定 `-DLUA_VERSION=`，并从仓库内 `3rd/lua-5.x.y` 编译对应解释器。
+`asyncsocket` 与 `luadap` 支持 **Lua 5.1 / 5.2 / 5.3 / 5.4**（不含 LuaJIT）。CMake **必须**指定 `-DLUA_VERSION=`；`3rd/CMakeLists.txt` 单独编译对应解释器，产物输出到 **`bin/lua5.x/`**。
 
 | 选项 | 含义 |
 |------|------|
-| `-DLUA_VERSION=` | `5.1` \| `5.2` \| `5.3` \| `5.4`（**必填**） |
+| `-DLUA_VERSION=` | `5.1` \| `5.2` \| `5.3` \| `5.4`（**必填**，编 vendored Lua 时） |
+| `LUA_INC_DIR` | Lua 头文件目录（由 `3rd` 自动设置，也可 `-D` 覆盖） |
+| `LUA_LIB_DIR` | Lua 库目录，默认 `bin/lua5.x`（`luadap` / `asyncsocket` 使用） |
+| `-DLUA_SKIP_VENDOR=ON` | 与自定义 `LUA_INC_DIR` + `LUA_LIB_DIR` 一起，跳过编仓库内 Lua |
 
 PowerShell 下请给版本号加引号，例如 `"-DLUA_VERSION=5.4"`，否则 `5.4` 会在点号处被拆开。
 
-`sample`（sol2 宿主）与完整工具链建议用 **5.4**。非 5.4 可编 `lua` + `asyncsocket` + `luadap`（及 `lua-runner`）。产物默认写到源码树 `bin/`。
+`sample`（sol2 宿主）与完整工具链建议用 **5.4**。非 5.4 可编 `lua` + `asyncsocket` + `luadap`（及 `lua-runner`）。
 
 ```powershell
 cmake -S . -B build "-DLUA_VERSION=5.4"
 cmake --build build --config Release --target lua-runner sample luadap asyncsocket
 
+# Lua 产物：bin/lua5.4/liblua.lib、lua.exe、luac.exe
 # 或 Ninja（见 build-ninja.bat）
 .\build-ninja.bat 5.4
 cmake --build build/ninja --target lua-runner sample
@@ -280,7 +286,7 @@ python test/test_dap_multi_state.py
 python test/test_dap_multi_state_mt.py
 ```
 
-测试脚本期望 `bin/lua.exe`、`bin/luadap.dll`、`bin/asyncsocket.dll`（及 runner 测试用的 `bin/lua-runner.exe`）已就绪。
+测试脚本期望 `bin/lua5.x/lua.exe`（或 `bin/lua.exe`）、`bin/luadap.dll`、`bin/asyncsocket.dll`（及 runner 测试用的 `bin/lua-runner.exe`）已就绪。
 
 ---
 

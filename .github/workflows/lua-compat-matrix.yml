@@ -21,23 +21,20 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path bin | Out-Null
-          $src = $null
-          foreach ($d in @("build/bin", "bin")) {
-            if (Test-Path (Join-Path $d "lua.exe")) {
-              $src = $d
-              break
-            }
+          $ver = "${{ matrix.lua }}"
+          $luaDir = Join-Path "bin" ("lua" + $ver)
+          if (-not (Test-Path (Join-Path $luaDir "lua.exe"))) {
+            throw "lua.exe not found in $luaDir after build"
           }
-          if (-not $src) { throw "lua.exe not found after build (tried build/bin and bin)" }
-          if ($src -ne "bin") {
-            Copy-Item -Force (Join-Path $src "lua.exe") bin/
-            Copy-Item -Force (Join-Path $src "asyncsocket.dll") bin/
-            Copy-Item -Force (Join-Path $src "luadap.dll") bin/
-          }
-          foreach ($name in @("lua.exe", "asyncsocket.dll", "luadap.dll")) {
+          # Tests / PATH expect flat bin/lua.exe alongside DLL modules.
+          Copy-Item -Force (Join-Path $luaDir "lua.exe") bin/
+          foreach ($name in @("asyncsocket.dll", "luadap.dll")) {
             if (-not (Test-Path (Join-Path "bin" $name))) {
-              throw "missing bin/$name after stage (src=$src)"
+              throw "missing bin/$name after build"
             }
+          }
+          if (-not (Test-Path "bin/lua.exe")) {
+            throw "missing bin/lua.exe after stage"
           }
       - name: Tests
         shell: pwsh

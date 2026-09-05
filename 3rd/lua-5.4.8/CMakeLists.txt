@@ -1,35 +1,49 @@
-﻿# 要求cmake是3.x的版本
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
+project(lua-5.4.8 C)
 
-# 解决方案名字叫lua-5.4.6
-project(lua-5.4.6)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# 使用的语言标准是C89/ANSI C
-set(CMAKE_C_STANDARD 90)
-
-# 添加附加目录
-include_directories(src)
-include_directories(inc)
-add_compile_options(-fPIC)
-file(GLOB LUALIB_SRC inc/*.h src/*.c)
-
-list(REMOVE_ITEM LUALIB_SRC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/lua.c  
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/luac.c
+set(LUA_CORE_SRC
+  src/lapi.c src/lcode.c src/lctype.c src/ldebug.c src/ldo.c src/ldump.c
+  src/lfunc.c src/lgc.c src/llex.c src/lmem.c src/lobject.c src/lopcodes.c
+  src/lparser.c src/lstate.c src/lstring.c src/ltable.c src/ltm.c
+  src/lundump.c src/lvm.c src/lzio.c
 )
 
-# 创建子项目——liblua.lib
-# 生成动态库——liblua.lib   XX为版本号，这里为54
-add_library(liblua ${LUALIB_SRC})
+set(LUA_LIB_SRC
+  src/lauxlib.c src/lbaselib.c src/lcorolib.c src/ldblib.c
+  src/liolib.c src/lmathlib.c src/loadlib.c src/loslib.c src/lstrlib.c
+  src/ltablib.c src/lutf8lib.c src/linit.c
+)
+
+add_library(liblua STATIC ${LUA_CORE_SRC} ${LUA_LIB_SRC})
+target_include_directories(liblua PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/inc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set_property(TARGET liblua PROPERTY FOLDER "lua")
 
-# 创建子项目——lua
-# 生成lua解释器——lua.exe
-add_executable(lua ${LUALIB_SRC} src/lua.c)
+add_executable(lua src/lua.c)
+target_link_libraries(lua PRIVATE liblua)
 set_property(TARGET lua PROPERTY FOLDER "lua")
 
-
-# 创建子项目——luac
-# 生成lua编译器——luac.exe
-add_executable(luac ${LUALIB_SRC} src/luac.c)
+add_executable(luac src/luac.c)
+target_link_libraries(luac PRIVATE liblua)
 set_property(TARGET luac PROPERTY FOLDER "lua")
+
+if(NOT WIN32)
+  target_compile_options(liblua PRIVATE -fPIC)
+endif()
+
+if(WIN32)
+  # no LUA_USE_* for default Windows static build
+elseif(APPLE)
+  target_compile_definitions(liblua PUBLIC LUA_USE_MACOSX)
+  target_link_libraries(liblua PUBLIC m)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(liblua PUBLIC LUA_USE_LINUX)
+  target_link_libraries(liblua PUBLIC m dl)
+else()
+  target_compile_definitions(liblua PUBLIC LUA_USE_POSIX)
+  target_link_libraries(liblua PUBLIC m)
+endif()

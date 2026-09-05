@@ -1,16 +1,39 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Requires (from root / 3rd):
+#   LUA_INC_DIR — Lua headers
+#   LUA_LIB_DIR — directory containing liblua (bin/lua5.x)
+
+if(NOT LUA_INC_DIR)
+    message(FATAL_ERROR "asyncsocket: LUA_INC_DIR is not set")
+endif()
+if(NOT LUA_LIB_DIR)
+    message(FATAL_ERROR "asyncsocket: LUA_LIB_DIR is not set")
+endif()
+
 set(ASYNCSOCKET_SOURCES asyncsocket.c poll_loop.c)
+
+function(asyncsocket_link_lua target)
+    target_include_directories(${target} PRIVATE ${LUA_INC_DIR})
+    target_link_directories(${target} PRIVATE ${LUA_LIB_DIR})
+    if(TARGET liblua)
+        target_link_libraries(${target} PRIVATE liblua)
+    else()
+        find_library(_AS_LUA_LIB NAMES liblua lua PATHS ${LUA_LIB_DIR} NO_DEFAULT_PATH)
+        if(NOT _AS_LUA_LIB)
+            message(FATAL_ERROR "asyncsocket: liblua not found in LUA_LIB_DIR=${LUA_LIB_DIR}")
+        endif()
+        target_link_libraries(${target} PRIVATE ${_AS_LUA_LIB})
+    endif()
+endfunction()
 
 function(asyncsocket_configure target)
     target_include_directories(${target} PRIVATE
-        ${LUA_INCLUDE_DIR}
+        ${LUA_INC_DIR}
         ${CMAKE_SOURCE_DIR}/native/lua_compat)
+    target_link_directories(${target} PRIVATE ${LUA_LIB_DIR})
     target_link_libraries(${target} PRIVATE lua_compat)
-
-    if(TARGET liblua)
-        target_link_libraries(${target} PRIVATE liblua)
-    endif()
+    asyncsocket_link_lua(${target})
 
     if(WIN32)
         target_link_libraries(${target} PRIVATE ws2_32)
