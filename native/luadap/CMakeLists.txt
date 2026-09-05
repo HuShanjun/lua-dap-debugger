@@ -8,15 +8,14 @@ set(LUADAP_SOURCES
     dap_json.c
     dap_sync.c
     dap_session.c
-    lua_debug.c
-    ${CMAKE_SOURCE_DIR}/3rd/cJSON/cJSON.c)
+    lua_debug.c)
 
 function(luadap_configure target)
     target_include_directories(${target} PRIVATE
         ${LUA_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/3rd/cJSON
+        ${CMAKE_SOURCE_DIR}/native/base/cjson
+        ${CMAKE_SOURCE_DIR}/native/lua_compat
         ${CMAKE_SOURCE_DIR}/native/asyncsocket
-        ${CMAKE_SOURCE_DIR}/native/common
         ${CMAKE_CURRENT_SOURCE_DIR})
     if(WIN32)
         target_compile_definitions(${target} PRIVATE
@@ -28,7 +27,7 @@ endfunction()
 
 add_library(luadap SHARED ${LUADAP_SOURCES})
 luadap_configure(luadap)
-target_link_libraries(luadap PRIVATE asyncsocket_static lua_compat liblua)
+target_link_libraries(luadap PRIVATE asyncsocket_static lua_compat cjson liblua)
 if(WIN32)
     target_link_libraries(luadap PRIVATE ws2_32)
 endif()
@@ -39,7 +38,7 @@ set_target_properties(luadap PROPERTIES
 add_library(luadap_static STATIC ${LUADAP_SOURCES})
 target_compile_definitions(luadap_static PUBLIC LUADAP_STATIC)
 luadap_configure(luadap_static)
-target_link_libraries(luadap_static PUBLIC asyncsocket_static lua_compat liblua)
+target_link_libraries(luadap_static PUBLIC asyncsocket_static lua_compat cjson liblua)
 if(WIN32)
     target_link_libraries(luadap_static PUBLIC ws2_32)
 endif()

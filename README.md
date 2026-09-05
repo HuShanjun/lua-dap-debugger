@@ -21,13 +21,14 @@ lua-dap-debugger/
 │       ├── main.lua              # 多协程演示（DAP threads）
 │       └── lua-runtime/          # 对照参考（非运行时）
 ├── native/
-│   ├── luadap/                   # DAP：framing / session / lua_debug
+│   ├── base/                     # C 基础库：cjson、circle_buffer
+│   ├── lua_compat/               # Lua 5.1–5.4 兼容层（独立静态库）
 │   ├── asyncsocket/              # 异步 TCP（poll 线程；luadap 静态链接）
-│   ├── common/                   # lua_compat（5.1–5.4）
+│   ├── luadap/                   # DAP：framing / session / lua_debug
 │   └── lua-runner/               # Launch 用 CLI：链接 liblua + luadap_static
 ├── vscode-extension/             # type: lua-dap（Launch spawn runner / Attach 端口）
 ├── test/                         # Python DAP / asyncsocket 回归
-├── 3rd/                          # cJSON、sol2、nlohmann、vendored Lua 源码树
+├── 3rd/                          # sol2、nlohmann、vendored Lua 源码树
 ├── bin/                          # 编译产物：lua-runner.exe、sample.exe、luadap.dll、lua.exe …
 └── .vscode/launch.json           # Debug Sample / Extension Host / lua-dap Launch·Attach
 ```

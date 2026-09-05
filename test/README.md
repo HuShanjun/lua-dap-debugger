@@ -126,7 +126,7 @@ cmake --build build/msvc --config Release --target `
 | 可执行文件 | 源码 | 作用 |
 |------------|------|------|
 | `coro_registry_test.exe` | `native/luadap/coro_registry_test.c` | 多 mainL 登记、`main/main` / `ui/main` 命名、threadId 不冲突 |
-| `circle_buffer_test.exe` | `native/common/circle_buffer_test.c` | `circle_buffer` 创建销毁、raw/framed push/pop、多块、空闲回收等 |
+| `circle_buffer_test.exe` | `native/base/circle_buffer/circle_buffer_test.c` | `circle_buffer` 创建销毁、raw/framed push/pop、多块、空闲回收等 |
 
 ```powershell
 .\bin\coro_registry_test.exe

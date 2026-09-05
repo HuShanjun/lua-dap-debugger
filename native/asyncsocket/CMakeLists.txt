@@ -5,7 +5,7 @@ set(ASYNCSOCKET_SOURCES asyncsocket.c poll_loop.c)
 function(asyncsocket_configure target)
     target_include_directories(${target} PRIVATE
         ${LUA_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/native/common)
+        ${CMAKE_SOURCE_DIR}/native/lua_compat)
     target_link_libraries(${target} PRIVATE lua_compat)
 
     if(TARGET liblua)

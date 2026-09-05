@@ -68,7 +68,8 @@ include_directories(3rd/nlohmann/include)
 
 link_directories(${OUTPUT_BIN_DIR})
 
-add_subdirectory(native/common)
+add_subdirectory(native/base)
+add_subdirectory(native/lua_compat)
 add_subdirectory(native/asyncsocket)
 add_subdirectory(native/luadap)
 add_subdirectory(native/lua-runner)

@@ -4,8 +4,8 @@ add_executable(lua-runner lua_runner.c)
 target_include_directories(lua-runner PRIVATE
   ${LUA_INCLUDE_DIR}
   ${CMAKE_SOURCE_DIR}/native/luadap
-  ${CMAKE_SOURCE_DIR}/native/common
-  ${CMAKE_SOURCE_DIR}/3rd/cJSON)
+  ${CMAKE_SOURCE_DIR}/native/lua_compat
+  ${CMAKE_SOURCE_DIR}/native/base/cjson)
 target_link_libraries(lua-runner PRIVATE luadap_static liblua)
 # WIN32: ws2_32 already via luadap_static transitive or add explicitly
 if(WIN32)
@@ -22,4 +22,3 @@ if(WIN32)
             "${CMAKE_SOURCE_DIR}/vscode-extension/bin/win32-x64/lua-runner.exe"
         COMMENT "Copy lua-runner to vscode-extension/bin/win32-x64")
 endif()
-
